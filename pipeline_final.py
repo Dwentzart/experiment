@@ -74,11 +74,18 @@ Portability:
     Agent constructor, so the pipeline does not crash on
     versions that lack max_execution_time.
 
+Command line:
+  python3 pipeline_final.py \\
+      --authorized-root /abs/path/to/repo \\
+      --project-dir /abs/path/to/repo \\
+      --repo-url https://github.com/owner/repo
+
 Use only on repositories you own or are authorized to test.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import inspect
 import json
@@ -2554,8 +2561,6 @@ class SecurityAnalysisServices:
 
         clean_relative = relative_path.replace("\\", "/").lstrip("/")
 
-        # NOTE: fingerprint signature is (test_file, test_name, property_text).
-        # Passing four positional arguments here was the crash this build fixes.
         fingerprint = self.scope.fingerprint(
             clean_relative,
             test_name,
@@ -3700,18 +3705,54 @@ Mark the report status as HUMAN_REVIEW_REQUIRED.
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description=(
+            "Authorized Solidity / Foundry security analysis pipeline. "
+            "Run on a repository you own or are authorized to test."
+        ),
+    )
+    parser.add_argument(
+        "--authorized-root", required=True,
+        help="Absolute path to the workspace root.",
+    )
+    parser.add_argument(
+        "--project-dir", required=True,
+        help="Absolute path to the Foundry project root "
+             "(usually the same as --authorized-root).",
+    )
+    parser.add_argument(
+        "--repo-url", required=True,
+        help="Repository URL for metadata only. No clone is performed.",
+    )
+    parser.add_argument("--forge-timeout", type=int, default=600)
+    parser.add_argument("--mutation-timeout", type=int, default=180)
+    parser.add_argument("--fuzz-runs", type=int, default=64)
+    parser.add_argument("--max-forge-runs", type=int, default=4)
+    parser.add_argument("--max-test-writes", type=int, default=2)
+    parser.add_argument("--max-mutation-runs", type=int, default=1)
+    parser.add_argument("--max-validation-attempts", type=int, default=1)
+    parser.add_argument(
+        "--disable-mutation", action="store_true",
+        help="Disable bounded mutation testing.",
+    )
+    parser.add_argument(
+        "--preflight-only", action="store_true",
+        help="Run preflight only and exit. Does not call the LLM.",
+    )
+    args = parser.parse_args()
+
     config = PipelineConfig(
-        repo_url="https://github.com/target-protocol/defi-vault",
-        authorized_root="./workspace",
-        project_dir="./workspace",
-        forge_timeout=300,
-        mutation_timeout=90,
-        fuzz_runs=256,
-        max_forge_runs=12,
-        max_test_writes=9,
-        max_mutation_runs=4,
-        max_validation_attempts=3,
-        enable_mutation_testing=True,
+        repo_url=args.repo_url,
+        authorized_root=args.authorized_root,
+        project_dir=args.project_dir,
+        forge_timeout=args.forge_timeout,
+        mutation_timeout=args.mutation_timeout,
+        fuzz_runs=args.fuzz_runs,
+        max_forge_runs=args.max_forge_runs,
+        max_test_writes=args.max_test_writes,
+        max_mutation_runs=args.max_mutation_runs,
+        max_validation_attempts=args.max_validation_attempts,
+        enable_mutation_testing=not args.disable_mutation,
         enable_evidence_artifacts=True,
     )
 
@@ -3720,7 +3761,14 @@ if __name__ == "__main__":
     print("=" * 70)
     print("PREFLIGHT")
     print("=" * 70)
-    print(json.dumps(pipeline.preflight(), indent=2))
+    pf = pipeline.preflight()
+    print(json.dumps(pf, indent=2))
+
+    if args.preflight_only:
+        raise SystemExit(0 if pf.get("ready") else 1)
+
+    if not pf.get("ready"):
+        raise SystemExit(1)
 
     result = pipeline.run()
 
