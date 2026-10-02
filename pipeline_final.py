@@ -1,4 +1,5 @@
 """
+pipeline_final.py
 
 Authorized Solidity / Foundry security analysis pipeline.
 
@@ -21,17 +22,52 @@ Hard controls:
         ffi / rpc_endpoints / eth_rpc_url / etherscan_api_key /
         private_key / sender / unlocked_accounts / fork_url /
         fork_block_number              -> hard reject
+        solc path/executable           -> hard reject; version only
         fs_permissions read-write      -> hard reject
         fs_permissions read on "/"     -> hard reject
         fs_permissions read project    -> allow with warning
   - forge-std presence is a hard preflight gate
+    (honors remappings.txt, falls back to lib/ and dependencies/)
   - tests only under test/security_pipeline/
   - never overwrite existing files
-  - symlink components rejected
+  - symlink components rejected for reads, writes, and evidence
   - forge / write / mutation budgets enforced in Python
   - per-hypothesis attempt budget enforced in Python
+  - each hypothesis is bound to one successfully written test file/name;
+    Forge and mutation tools cannot redirect it to another test
+  - each hypothesis must declare a target contract and target function
+    that actually exist in the scanned source; write_test refuses
+    hallucinated targets before the test file is created
+  - fs_permissions reads must remain within the project and cannot
+    grant the whole project root
+  - remapping targets must remain within the project
+  - mutation copies reject symlinks before copytree follows them
   - mutation sandbox stays inside authorized_root
   - reporter emits DRAFT, status HUMAN_REVIEW_REQUIRED
+
+Review-driven hardening:
+  - Forge executable resolved once at service init and reused
+    for every run and evidence collection, so PATH cannot shift
+    between preflight, version capture, and execution.
+  - Subprocess timeouts kill the whole process group (forge
+    spawns solc and other helpers; killing only the direct
+    child leaves orphans).
+  - classify_result checks parsed test counts BEFORE looking
+    for compilation markers, so a failing assertion whose
+    message contains "error" is never misread as a compile
+    failure. Marker list is narrow and anchored.
+  - remappings.txt is parsed with trailing-comment stripping
+    and last-wins semantics; context-scoped mappings are
+    consulted when no global forge-std mapping exists.
+  - Source search rejects nested-quantifier regexes and caps
+    per-line match length to avoid catastrophic backtracking.
+  - Directory traversal uses os.scandir with in-place pruning,
+    so lib/ and cache dirs are never entered.
+  - Duplicate fingerprints normalize the property text so two
+    runs describing the same property collide even when an
+    LLM varies whitespace, punctuation, or file names.
+  - Contract scope validation refuses hypotheses whose target
+    contract or function does not appear in scanned source.
 
 Portability:
   - Agent kwargs are filtered against the installed CrewAI
@@ -49,9 +85,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 import tomllib
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -78,7 +116,12 @@ def _safe_agent_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
             return dict(kwargs)
         allowed = set(sig.parameters.keys())
         return {k: v for k, v in kwargs.items() if k in allowed}
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            "_safe_agent_kwargs could not introspect CrewAI Agent "
+            f"signature ({exc!r}); falling back to minimal limits.",
+            stacklevel=2,
+        )
         return {
             k: v for k, v in kwargs.items()
             if k in ("max_iter", "max_rpm")
@@ -208,7 +251,36 @@ def build_sanitized_env() -> Dict[str, str]:
 
 _TEST_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _HYPOTHESIS_ID_RE = re.compile(r"^HYP-[0-9]{3,}$")
+_SOLC_VERSION_RE = re.compile(
+    r"^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$"
+)
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+# Upper bound on the number of characters regex-matched per line.
+_MAX_REGEX_LINE = 2_000
+
+
+def _looks_catastrophic(pattern: str) -> bool:
+    """Approximate static check for nested quantifiers.
+
+    Detects patterns like (x+)+, (x*)*, (x|x)*, (a{1,})*, and
+    similar shapes that commonly cause exponential backtracking.
+    Not a proof of safety, but catches the common cases.
+    """
+    if not pattern:
+        return False
+    # Group followed by a quantifier, where the group itself
+    # contains a quantifier or alternation.
+    if re.search(r"\([^()]*[+*][^()]*\)\s*[+*{]", pattern):
+        return True
+    # Alternation inside a group followed by a quantifier.
+    if re.search(r"\([^()]*\|[^()]*\)\s*[+*{]", pattern):
+        return True
+    # Explicit nested bounded quantifiers: (a{1,100}){1,100}
+    if re.search(r"\([^()]*\{\d+,\d*\}[^()]*\)\s*\{", pattern):
+        return True
+    return False
+
 
 COPY_IGNORE = shutil.ignore_patterns(
     ".git",
@@ -223,6 +295,87 @@ COPY_IGNORE = shutil.ignore_patterns(
     ".vscode",
     "__pycache__",
 )
+
+
+def reject_symlinks_tree(root: Path) -> None:
+    """Reject symlinks anywhere in content that mutation copytree may copy."""
+    root = root.resolve()
+    ignored = {
+        ".git", ".github", ".security_pipeline", "out", "cache",
+        "broadcast", "node_modules", "target", ".idea", ".vscode",
+        "__pycache__",
+    }
+
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError as exc:
+            raise ValueError(f"Unable to inspect workspace: {current}: {exc}") from exc
+
+        for entry in entries:
+            if entry.is_symlink():
+                raise ValueError(
+                    f"Symlink is not permitted in mutation source tree: {entry.path}"
+                )
+            if entry.is_dir(follow_symlinks=False) and entry.name not in ignored:
+                stack.append(Path(entry.path))
+
+
+# Directories the source slicer skips when listing or searching.
+# These are either caches, build artifacts, or vendored code that
+# would drown out the pipeline's own generated tests and src/.
+SLICER_SKIP_DIRS = {
+    "lib",
+    "node_modules",
+    "out",
+    "cache",
+    "broadcast",
+    ".git",
+    ".github",
+    ".security_pipeline",
+    ".forge",
+    "target",
+    ".idea",
+    ".vscode",
+    "__pycache__",
+}
+
+
+def _iter_files_pruned(
+    root: Path,
+    skip_dirs: set,
+    suffixes: Optional[set] = None,
+):
+    """Yield files under root while pruning skip_dirs in place.
+
+    os.scandir with in-place dirs pruning avoids entering
+    directories we would immediately filter out (lib/,
+    cache/, out/, etc.). On real DeFi repos this turns an
+    O(vendored_size) walk into O(src_size).
+    """
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    name = entry.name
+                    if name in skip_dirs:
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            if suffixes is None or any(
+                                name.endswith(s) for s in suffixes
+                            ):
+                                yield Path(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
 
 
 def resolve_root(path: str | Path) -> Path:
@@ -299,6 +452,34 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+# Filler words that vary between LLM runs for the same
+# property description and do not carry security meaning.
+_PROPERTY_FILLER = {
+    "a", "an", "the", "is", "are", "was", "were",
+    "be", "can", "could", "may", "might", "should",
+    "of", "in", "on", "at", "to", "for", "by",
+}
+
+
+def _normalize_property(text: str) -> str:
+    """Normalize a property description for fingerprinting.
+
+    - lowercase
+    - replace punctuation with spaces
+    - collapse whitespace
+    - drop stopwords that vary between LLM runs
+    """
+    if not text:
+        return ""
+    t = text.lower()
+    t = re.sub(r"[^a-z0-9_\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return ""
+    tokens = [w for w in t.split() if w not in _PROPERTY_FILLER]
+    return " ".join(tokens)
+
+
 def safe_artifact_name(name: str) -> str:
     cleaned = _SAFE_NAME_RE.sub("_", name).strip("._")
     return cleaned[:120] or "artifact"
@@ -337,12 +518,18 @@ class ValidationBudget:
         self.writes_used += 1
         return None
 
-    def consume_forge(self, hypothesis_id: str) -> Optional[str]:
+    def consume_forge_execution(self) -> Optional[str]:
+        """Consume one global Forge execution, including mutation runs."""
         if self.forge_runs_used >= self.max_forge_runs:
             return (
                 f"Forge-run budget exhausted "
                 f"({self.max_forge_runs})."
             )
+        self.forge_runs_used += 1
+        return None
+
+    def consume_forge(self, hypothesis_id: str) -> Optional[str]:
+        """Consume a normal validation attempt plus one Forge execution."""
         used = self.attempts.get(hypothesis_id, 0)
         if used >= self.max_attempts_per_hypothesis:
             return (
@@ -350,7 +537,9 @@ class ValidationBudget:
                 f"{hypothesis_id} "
                 f"({self.max_attempts_per_hypothesis})."
             )
-        self.forge_runs_used += 1
+        error = self.consume_forge_execution()
+        if error:
+            return error
         self.attempts[hypothesis_id] = used + 1
         return None
 
@@ -430,7 +619,7 @@ class FoundryConfigAudit:
             }
 
         errors: List[str] = []
-        warnings: List[str] = []
+        warnings_list: List[str] = []
         found_keys: List[str] = []
 
         try:
@@ -461,10 +650,17 @@ class FoundryConfigAudit:
                     )
                     continue
 
+                if key_lower == "solc":
+                    cls._audit_solc(
+                        child, full_key,
+                        errors, warnings_list, found_keys,
+                    )
+                    continue
+
                 if key_lower == "fs_permissions":
                     cls._audit_fs_permissions(
-                        child, full_key,
-                        errors, warnings, found_keys,
+                        child, full_key, project,
+                        errors, warnings_list, found_keys,
                     )
                     continue
 
@@ -474,17 +670,39 @@ class FoundryConfigAudit:
         return {
             "safe_to_execute": not errors,
             "errors": errors,
-            "warnings": warnings,
+            "warnings": warnings_list,
             "found_keys": found_keys,
         }
+
+    @classmethod
+    def _audit_solc(
+        cls,
+        value: Any,
+        full_key: str,
+        errors: List[str],
+        warnings_list: List[str],
+        found_keys: List[str],
+    ) -> None:
+        value_text = str(value).strip()
+        if not _SOLC_VERSION_RE.fullmatch(value_text):
+            found_keys.append(full_key)
+            errors.append(
+                f"Unsafe solc executable/path refused at "
+                f"{full_key}: {value_text!r}"
+            )
+            return
+        warnings_list.append(
+            f"solc version selector allowed at {full_key}: {value_text!r}"
+        )
 
     @classmethod
     def _audit_fs_permissions(
         cls,
         value: Any,
         full_key: str,
+        project: Path,
         errors: List[str],
-        warnings: List[str],
+        warnings_list: List[str],
         found_keys: List[str],
     ) -> None:
         entries = value if isinstance(value, list) else [value]
@@ -495,7 +713,7 @@ class FoundryConfigAudit:
 
             if isinstance(entry, str):
                 if ":" not in entry:
-                    warnings.append(
+                    warnings_list.append(
                         f"Unparsed fs_permissions entry at "
                         f"{full_key}: {entry!r}"
                     )
@@ -509,7 +727,7 @@ class FoundryConfigAudit:
                 ).strip().lower()
                 path = str(entry.get("path", "")).strip()
             else:
-                warnings.append(
+                warnings_list.append(
                     f"Unknown fs_permissions entry type at "
                     f"{full_key}: {type(entry).__name__}"
                 )
@@ -524,7 +742,7 @@ class FoundryConfigAudit:
                 continue
 
             if access != "read":
-                warnings.append(
+                warnings_list.append(
                     f"Unrecognized fs_permissions access "
                     f"{access!r} at {full_key}"
                 )
@@ -538,10 +756,117 @@ class FoundryConfigAudit:
                 )
                 continue
 
-            warnings.append(
-                f"fs_permissions read-only allowed at "
+            try:
+                resolved_permission = (project / path).resolve()
+                resolved_permission.relative_to(project.resolve())
+            except (OSError, ValueError):
+                found_keys.append(full_key)
+                errors.append(
+                    f"fs_permissions read path escapes project: "
+                    f"{path!r} at {full_key}"
+                )
+                continue
+
+            if resolved_permission == project.resolve():
+                found_keys.append(full_key)
+                errors.append(
+                    "fs_permissions read on the entire project root "
+                    f"is refused at {full_key}: {path!r}"
+                )
+                continue
+
+            warnings_list.append(
+                f"fs_permissions read-only allowed within project at "
                 f"{full_key}: {entry!r}"
             )
+
+
+# ============================================================
+# FORGE-STD LOCATOR
+# ============================================================
+
+
+def _parse_remappings(path: Path) -> Dict[str, str]:
+    """Parse remappings.txt into a dict.
+
+    Rules honored:
+      - '#' starts a trailing comment on any line.
+      - The last assignment for a given prefix wins.
+      - Whitespace around prefix and target is stripped.
+    Context-scoped prefixes such as 'src/foo/=' are kept
+    as-is; the caller decides whether to use them.
+    """
+    result: Dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return result
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        prefix, _, target = line.partition("=")
+        prefix = prefix.strip()
+        target = target.strip()
+        if not prefix or not target:
+            continue
+        result[prefix] = target
+    return result
+
+
+def find_forge_std(project: Path) -> Optional[Path]:
+    """
+    Locate the forge-std Test.sol entry point.
+
+    Honors remappings.txt when present so that projects with
+    custom layouts (dependencies/, submodules/, etc.) do not
+    fail preflight spuriously. Prefers the global mapping
+    'forge-std/' or 'forge-std'; falls back to any context-
+    scoped mapping that resolves to a real Test.sol.
+    """
+    candidates: List[Path] = []
+
+    remappings_path = project / "remappings.txt"
+    if remappings_path.is_file() and not remappings_path.is_symlink():
+        remappings = _parse_remappings(remappings_path)
+
+        # Prefer an exact global mapping.
+        global_targets: List[str] = []
+        for key in ("forge-std/", "forge-std"):
+            if key in remappings:
+                global_targets.append(remappings[key])
+
+        # Fall back to context-scoped mappings.
+        context_targets: List[str] = []
+        for key, target in remappings.items():
+            if key in ("forge-std/", "forge-std"):
+                continue
+            tail = key.rstrip("/").rsplit("/", 1)[-1]
+            if tail == "forge-std":
+                context_targets.append(target)
+
+        for target in global_targets + context_targets:
+            try:
+                base = (project / target).resolve()
+                base.relative_to(project.resolve())
+            except (OSError, ValueError):
+                continue
+            candidates.append(base / "Test.sol")
+
+    candidates.extend([
+        project / "lib" / "forge-std" / "src" / "Test.sol",
+        project / "lib" / "forge-std" / "Test.sol",
+        project / "dependencies" / "forge-std" / "src" / "Test.sol",
+    ])
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and not candidate.is_symlink():
+                return candidate
+        except OSError:
+            continue
+
+    return None
 
 
 # ============================================================
@@ -553,6 +878,20 @@ class TestSpecification(BaseModel):
     hypothesis_id: str
     test_name: str
     test_file: str
+    target_contract: str = Field(
+        ...,
+        description=(
+            "Exact Solidity contract name the hypothesis "
+            "targets, e.g. PoolManager."
+        ),
+    )
+    target_function: str = Field(
+        ...,
+        description=(
+            "Exact function name on that contract that the "
+            "invariant is about, e.g. swap."
+        ),
+    )
     property: str
     expected_behavior: str
     rationale: str
@@ -616,9 +955,27 @@ class FindingConfidence(BaseModel):
     """
     Evidence-status ladder per hypothesis.
 
-    This is intentionally a status, not a numeric score. A
-    hypothesis climbs the ladder only when the corresponding
-    deterministic stage actually happened.
+    This is a status, not a numeric score. Each stage is only
+    advanced when the pipeline's own deterministic control points
+    are reached:
+
+      SOURCE / REACHABILITY / INVARIANT
+        advanced together when a test is successfully written,
+        because the pipeline's workflow implies those checks
+        were satisfied by the earlier agents.
+      TEST_WRITTEN
+        advanced when a test file is on disk.
+      TEST_EXECUTED
+        advanced when forge returns TEST_PASS or TEST_FAILURE.
+      TEST_VALIDATED
+        advanced when the observed result matches the declared
+        test_mode's positive signal.
+      INTEGRITY_OK
+        advanced when the workspace snapshot before and after the
+        forge run match and are not truncated.
+
+    mutation_killed is tracked as a separate test-quality signal.
+    It is not part of the vulnerability evidence ladder.
     """
 
     hypothesis_id: str
@@ -664,8 +1021,6 @@ class FindingConfidence(BaseModel):
             return "TEST_EXECUTED"
         if not self.integrity_ok:
             return "TEST_VALIDATED"
-        if not self.mutation_killed:
-            return "INTEGRITY_OK"
         return "FULL_VALIDATION"
 
 
@@ -681,7 +1036,8 @@ class WorkspaceIntegrity:
     Vendor directories (lib/) are intentionally excluded: they
     are large in real DeFi projects, not the analysis target, and
     pinned by forge via submodules / remappings. Hashing them on
-    every forge run is a needless bottleneck.
+    every forge run is a needless bottleneck. A truncated snapshot
+    is explicitly treated as UNVERIFIED, never as integrity success.
     """
 
     TRACKED_FILES = ("foundry.toml", "remappings.txt")
@@ -721,7 +1077,12 @@ class WorkspaceIntegrity:
             target = root / name
             if not target.is_dir():
                 continue
-            for path in sorted(target.rglob("*"), key=lambda p: str(p)):
+            for path in sorted(
+                _iter_files_pruned(
+                    target, cls.EXCLUDED_DIR_NAMES,
+                ),
+                key=lambda p: str(p),
+            ):
                 if count >= limit_files:
                     result["__truncated__"] = "1"
                     return result
@@ -730,11 +1091,6 @@ class WorkspaceIntegrity:
                 try:
                     rel = path.relative_to(root)
                 except ValueError:
-                    continue
-                if any(
-                    part in cls.EXCLUDED_DIR_NAMES
-                    for part in rel.parts
-                ):
                     continue
                 try:
                     result[str(rel)] = sha256_file(path)
@@ -765,24 +1121,46 @@ class EvidenceStore:
             directory.mkdir(parents=True, exist_ok=True)
         return directory
 
+    def _safe_write(
+        self,
+        path: Path,
+        data: Any,
+    ) -> Optional[str]:
+        """
+        Write JSON to path, refusing if any component between
+        self.root and path is a symlink. This keeps evidence
+        artifacts inside .security_pipeline even if a sandbox
+        copy or manual step introduced a symlink.
+        """
+        if not self.enabled:
+            return None
+        try:
+            reject_symlink_components(path, self.root)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            reject_symlink_components(path, self.root)
+        except (ValueError, OSError):
+            return None
+        try:
+            path.write_text(
+                json.dumps(
+                    data, indent=2,
+                    ensure_ascii=False, default=str,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            return None
+        return str(path)
+
     def write_json(
         self,
         relative: str,
         data: Any,
     ) -> Optional[str]:
-        if not self.enabled:
-            return None
         path = self.root / safe_artifact_name(
             relative.replace("/", "_")
         )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                data, indent=2, ensure_ascii=False, default=str
-            ),
-            encoding="utf-8",
-        )
-        return str(path)
+        return self._safe_write(path, data)
 
     def write_hypothesis_json(
         self,
@@ -790,19 +1168,11 @@ class EvidenceStore:
         name: str,
         data: Any,
     ) -> Optional[str]:
-        if not self.enabled:
-            return None
         path = (
             self.hypothesis_dir(hypothesis_id)
             / safe_artifact_name(name)
         )
-        path.write_text(
-            json.dumps(
-                data, indent=2, ensure_ascii=False, default=str
-            ),
-            encoding="utf-8",
-        )
-        return str(path)
+        return self._safe_write(path, data)
 
 
 # ============================================================
@@ -830,14 +1200,27 @@ class ScopeDuplicateChecker:
 
     @staticmethod
     def fingerprint(
-        hypothesis_id: str,
+        test_file: str,
         test_name: str,
         property_text: str,
     ) -> str:
+        """
+        Compute a stable fingerprint for a proposed finding.
+
+        The normalized property is the primary signal. Two
+        hypotheses with the same underlying property collide
+        even when an LLM varies whitespace, punctuation, or
+        file names between runs. When the property is too
+        short to be meaningful, the fingerprint falls back to
+        the file name plus test name.
+        """
+        normalized = _normalize_property(property_text)
         material = "||".join(
-            part.strip().lower()
+            part.strip().lower().replace("\\", "/")
             for part in (
-                hypothesis_id, test_name, property_text
+                str(Path(test_file)).replace("\\", "/"),
+                test_name or "",
+                normalized,
             )
         )
         return hashlib.sha256(
@@ -886,7 +1269,10 @@ class SourceSlicer:
     Slice-lite: list / read / bounded search.
 
     Not a full SSA / call-graph slicer. It exists to keep agent
-    context on relevant files instead of guessing paths.
+    context on relevant files instead of guessing paths. Vendor
+    and cache directories are excluded so that library code does
+    not drown out the target contracts or the pipeline's own
+    generated tests.
     """
 
     SOURCE_SUFFIXES = {".sol"}
@@ -905,6 +1291,13 @@ class SourceSlicer:
         self.max_search_hits = max_search_hits
         self.max_pattern_chars = max_pattern_chars
 
+    def _should_skip(self, path: Path) -> bool:
+        try:
+            rel = path.relative_to(self.root)
+        except ValueError:
+            return True
+        return any(part in SLICER_SKIP_DIRS for part in rel.parts)
+
     def list_files(
         self,
         relative_path: str = "",
@@ -920,17 +1313,19 @@ class SourceSlicer:
             }
 
         files: List[str] = []
-        for item in sorted(
-            target.rglob("*"), key=lambda p: str(p)
+        for item in _iter_files_pruned(
+            target, SLICER_SKIP_DIRS,
         ):
             if len(files) >= self.max_list_entries:
                 break
+            if self._should_skip(item):
+                continue
             try:
                 reject_symlink_components(item, self.root)
             except ValueError:
                 continue
-            if item.is_file():
-                files.append(str(item.relative_to(self.root)))
+            files.append(str(item.relative_to(self.root)))
+        files.sort()
 
         return {
             "success": True,
@@ -939,7 +1334,76 @@ class SourceSlicer:
             "total_returned": len(files),
             "truncated":
                 len(files) >= self.max_list_entries,
+            "skipped_dirs": sorted(SLICER_SKIP_DIRS),
+            "note": (
+                "Vendor and cache directories are hidden. "
+                "Use Search Authorized Solidity Source if you "
+                "need to look inside lib/."
+            ),
         }
+
+    def contract_exists(self, contract: str) -> bool:
+        """Return True if any scanned .sol file declares the
+        given contract or interface. Uses the same pruned
+        traversal as list/search so lib/ is not scanned."""
+        if not contract or not _TEST_NAME_RE.fullmatch(contract):
+            return False
+        pattern = re.compile(
+            rf"\b(?:contract|interface|library)\s+"
+            rf"{re.escape(contract)}\b"
+        )
+        for path in _iter_files_pruned(
+            self.root, SLICER_SKIP_DIRS, {".sol"},
+        ):
+            try:
+                if path.stat().st_size > self.max_read_bytes:
+                    continue
+                text = path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                continue
+            if pattern.search(text):
+                return True
+        return False
+
+    def function_exists(
+        self, contract: str, function: str
+    ) -> bool:
+        """Return True if the given contract declares a
+        function, modifier, or constructor with the given
+        name. This is a syntactic check, not a full resolve
+        of inheritance; it only guarantees the name appears
+        in the same file as the contract declaration."""
+        if not contract or not function:
+            return False
+        if not _TEST_NAME_RE.fullmatch(contract):
+            return False
+        if not _TEST_NAME_RE.fullmatch(function):
+            return False
+        contract_decl = re.compile(
+            rf"\b(?:contract|interface|library)\s+"
+            rf"{re.escape(contract)}\b"
+        )
+        func_decl = re.compile(
+            rf"\bfunction\s+{re.escape(function)}\s*\("
+        )
+        for path in _iter_files_pruned(
+            self.root, SLICER_SKIP_DIRS, {".sol"},
+        ):
+            try:
+                if path.stat().st_size > self.max_read_bytes:
+                    continue
+                text = path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                continue
+            if not contract_decl.search(text):
+                continue
+            if func_decl.search(text):
+                return True
+        return False
 
     def read(self, relative_path: str) -> Dict[str, Any]:
         clean = str(relative_path).replace("\\", "/").lstrip("/")
@@ -1006,6 +1470,20 @@ class SourceSlicer:
 
         if pattern.startswith("re:"):
             raw = pattern[3:]
+            # Static rejection of nested quantifiers. A pattern
+            # like '(a+)+$' can hang the interpreter on a line
+            # of ~30 chars. Python's re has no timeout, so we
+            # refuse these outright rather than risk a stall.
+            if _looks_catastrophic(raw):
+                return {
+                    "success": False,
+                    "result_type": "SEARCH_REJECTED",
+                    "error": (
+                        "Pattern contains nested quantifiers "
+                        "that could cause catastrophic "
+                        "backtracking."
+                    ),
+                }
         else:
             raw = re.escape(pattern)
 
@@ -1019,7 +1497,11 @@ class SourceSlicer:
             }
 
         hits: List[Dict[str, Any]] = []
-        for path in sorted(self.root.rglob("*.sol")):
+        for path in _iter_files_pruned(
+            self.root, SLICER_SKIP_DIRS, {".sol"},
+        ):
+            if self._should_skip(path):
+                continue
             try:
                 reject_symlink_components(path, self.root)
             except ValueError:
@@ -1037,7 +1519,16 @@ class SourceSlicer:
             for lineno, line in enumerate(
                 text.splitlines(), 1
             ):
-                if regex.search(line):
+                # Cap line length before matching. Solidity
+                # sources sometimes contain a single generated
+                # line with thousands of characters; regex on
+                # such a line can be slow even without nested
+                # quantifiers.
+                candidate = (
+                    line if len(line) <= _MAX_REGEX_LINE
+                    else line[:_MAX_REGEX_LINE]
+                )
+                if regex.search(candidate):
                     hits.append({
                         "file": str(path.relative_to(self.root)),
                         "line": lineno,
@@ -1067,7 +1558,10 @@ class SourceSlicer:
 
 class ReproducibilityLock:
     @staticmethod
-    def collect(project: Path) -> Dict[str, Any]:
+    def collect(
+        project: Path,
+        forge_executable: Optional[str],
+    ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "timestamp_utc": int(time.time()),
             "project": str(project),
@@ -1078,8 +1572,11 @@ class ReproducibilityLock:
         if toml.is_file() and not toml.is_symlink():
             result["foundry_toml_sha256"] = sha256_file(toml)
         try:
+            if not forge_executable:
+                result["forge_version"] = "unavailable: forge executable not pinned"
+                return result
             proc = subprocess.run(
-                ["forge", "--version"],
+                [forge_executable, "--version"],
                 cwd=str(project),
                 env=build_sanitized_env(),
                 capture_output=True,
@@ -1188,6 +1685,43 @@ class TestFileWriter:
 
 
 # ============================================================
+# PROCESS GROUP HELPERS
+# ============================================================
+
+
+class _CompletedRun:
+    """Minimal holder matching the attrs we used from
+    subprocess.CompletedProcess."""
+    __slots__ = ("returncode", "stdout", "stderr")
+
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """Kill the entire process group of a started Popen.
+    Falls back to direct kill if killpg is unavailable."""
+    if proc.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (AttributeError, ProcessLookupError, OSError):
+        pgid = None
+    try:
+        if pgid is not None and hasattr(os, "killpg"):
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+# ============================================================
 # FORGE RUNNER
 # ============================================================
 
@@ -1200,22 +1734,55 @@ class ForgeTestRunner:
         fuzz_runs: int,
         max_output_chars: int,
         max_evidence_items: int,
+        forge_executable: Optional[str] = None,
     ):
         self.root = root
         self.timeout = timeout
         self.fuzz_runs = max(1, min(fuzz_runs, 100_000))
         self.max_output_chars = max_output_chars
         self.max_evidence_items = max_evidence_items
+        # Resolved once by SecurityAnalysisServices so that
+        # PATH cannot change under us between preflight and
+        # run. Falls back to a lazy which() only if the
+        # service did not provide a path (e.g. direct tests).
+        self.forge_executable = forge_executable
+
+    @staticmethod
+    def _kill_process_group(proc: "subprocess.Popen") -> None:
+        _kill_process_group(proc)
 
     def run(
         self,
         project: Path,
         match_test: Optional[str] = None,
+        match_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         try:
             project = resolve_inside_root(project, self.root)
             reject_symlink_components(project, self.root)
             match_test = validate_test_name(match_test)
+            if match_path is not None:
+                clean_match_path = (
+                    str(match_path)
+                    .replace("\\", "/")
+                    .lstrip("/")
+                )
+                bound_path = resolve_inside_root(
+                    project / clean_match_path, project
+                )
+                reject_symlink_components(bound_path, project)
+                if (
+                    not clean_match_path.startswith(
+                        "test/security_pipeline/"
+                    )
+                    or not bound_path.is_file()
+                    or bound_path.is_symlink()
+                ):
+                    raise ValueError(
+                        "match_path must identify an existing generated "
+                        "test under test/security_pipeline/."
+                    )
+                match_path = clean_match_path
         except ValueError as exc:
             return {
                 "success": False,
@@ -1246,8 +1813,17 @@ class ForgeTestRunner:
                 "config_audit": config_audit,
             }
 
+        forge_executable = self.forge_executable
+        if not forge_executable or not os.path.isabs(forge_executable):
+            return {
+                "success": False,
+                "result_type": "EXECUTION_ERROR",
+                "error": "forge executable was not found in PATH.",
+                "config_audit": config_audit,
+            }
+
         command = [
-            "forge", "test",
+            forge_executable, "test",
             "--root", str(project),
             "--no-ffi",
             "--fuzz-runs", str(self.fuzz_runs),
@@ -1255,35 +1831,20 @@ class ForgeTestRunner:
         ]
         if match_test:
             command.extend(["--match-test", match_test])
+        if match_path:
+            command.extend(["--match-path", match_path])
 
         try:
-            completed = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 cwd=str(project),
                 env=build_sanitized_env(),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.timeout,
                 shell=False,
-                check=False,
                 start_new_session=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            return {
-                "success": False,
-                "result_type": "EXECUTION_ERROR",
-                "error":
-                    f"forge test timed out after {self.timeout}s.",
-                "stdout": truncate(
-                    self._decode(exc.stdout),
-                    self.max_output_chars,
-                ),
-                "stderr": truncate(
-                    self._decode(exc.stderr),
-                    self.max_output_chars,
-                ),
-                "config_audit": config_audit,
-            }
         except FileNotFoundError:
             return {
                 "success": False,
@@ -1298,15 +1859,49 @@ class ForgeTestRunner:
                 "error": str(exc),
             }
 
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
+        # On timeout, kill the whole process group. forge spawns
+        # solc and other helpers; subprocess.run's default kill
+        # only signals the direct child.
+        try:
+            stdout, stderr = proc.communicate(timeout=self.timeout)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            self._kill_process_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            return {
+                "success": False,
+                "result_type": "EXECUTION_ERROR",
+                "error":
+                    f"forge test timed out after {self.timeout}s.",
+                "stdout": truncate(
+                    stdout or "", self.max_output_chars,
+                ),
+                "stderr": truncate(
+                    stderr or "", self.max_output_chars,
+                ),
+                "config_audit": config_audit,
+            }
+
+        stdout = stdout or ""
+        stderr = stderr or ""
+        completed = _CompletedRun(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
         combined = stdout + "\n" + stderr
         summary = self.parse_output(stdout, stderr)
         result_type = self.classify_result(
             completed.returncode, combined, summary
         )
         return {
-            "success": completed.returncode == 0,
+            # A zero exit code alone is insufficient: Forge can exit
+            # cleanly while no recognizable test result was produced.
+            "success": result_type == "TEST_PASS",
             "result_type": result_type,
             "returncode": completed.returncode,
             "summary": summary,
@@ -1315,25 +1910,33 @@ class ForgeTestRunner:
             "config_audit": config_audit,
         }
 
-    @staticmethod
-    def is_compilation_error(text: str) -> bool:
+    # Phrases forge and solc emit only when compilation fails.
+    # Kept deliberately narrow: broad tokens like 'error (' or
+    # 'error[' also appear in failed assertion output.
+    _COMPILATION_MARKERS = (
+        "compiler run failed",
+        "compilation failed",
+        "compilation error",
+        "failed to compile",
+        "source file not found",
+        "parsererror",
+        "declarationerror",
+        "undeclared identifier",
+    )
+
+    _SOLC_ERROR_LINE = re.compile(
+        r"^\s*Error\s*\(\d+\)\s*:",
+        re.MULTILINE,
+    )
+
+    @classmethod
+    def is_compilation_error(cls, text: str) -> bool:
         lower = text.lower()
-        markers = (
-            "compiler run failed",
-            "compilation failed",
-            "compilation error",
-            "compiler error",
-            "failed to compile",
-            "parsererror",
-            "typeerror:",
-            "declarationerror:",
-            "undeclared identifier",
-            "source file not found",
-            "error[sol",
-            "error (",
-            "error[",
-        )
-        return any(marker in lower for marker in markers)
+        if any(m in lower for m in cls._COMPILATION_MARKERS):
+            return True
+        if cls._SOLC_ERROR_LINE.search(text):
+            return True
+        return False
 
     @classmethod
     def classify_result(
@@ -1342,21 +1945,23 @@ class ForgeTestRunner:
         combined: str,
         summary: Dict[str, Any],
     ) -> str:
+        # If forge emitted test counts, compilation succeeded.
+        # A failing test often prints words like 'error' inside
+        # its assertion message; we must not misclassify it as
+        # COMPILATION_ERROR on a keyword match alone.
+        if summary.get("parse_valid"):
+            if (
+                summary.get("tests_failed", 0) > 0
+                or returncode != 0
+            ):
+                return "TEST_FAILURE"
+            if summary.get("tests_passed", 0) > 0:
+                return "TEST_PASS"
+            return "NO_TESTS_RECOGNIZED"
         if cls.is_compilation_error(combined):
             return "COMPILATION_ERROR"
-        if not summary.get("parse_valid"):
-            return (
-                "UNPARSED_RESULT"
-                if returncode != 0
-                else "NO_TESTS_RECOGNIZED"
-            )
-        if (
-            summary.get("tests_failed", 0) > 0
-            or returncode != 0
-        ):
-            return "TEST_FAILURE"
-        if summary.get("tests_passed", 0) > 0:
-            return "TEST_PASS"
+        if returncode != 0:
+            return "UNPARSED_RESULT"
         return "NO_TESTS_RECOGNIZED"
 
     def parse_output(
@@ -1444,10 +2049,16 @@ class ForgeTestRunner:
 # ============================================================
 
 
-# Mutation statuses considered a valid kill.
 MUTATION_STRONG_KILLS = {
     "KILLED_BY_ASSERTION",
     "KILLED_BY_TEST_FAILURE",
+}
+
+# Statuses that should not be counted as "applicable" when
+# computing the mutation score.
+MUTATION_NON_APPLICABLE = {
+    "NOT_APPLICABLE",
+    "BUDGET_EXHAUSTED",
 }
 
 
@@ -1457,15 +2068,54 @@ class MutationTester:
 
     Mutates only a generated test in a sandbox copy inside
     authorized_root. Never mutates production contracts.
+
+    Mutations are chosen to be semantic changes that a correct
+    test should detect. Cosmetic or commutative rewrites
+    (assertEq(a,b) <-> assertEq(b,a)) are deliberately avoided
+    because they would always survive and produce a misleading
+    "PARTIAL_KILL" signal.
     """
 
     def __init__(
         self,
         runner: ForgeTestRunner,
         timeout: int,
+        forge_budget_gate=None,
     ):
         self.runner = runner
         self.timeout = timeout
+        self.forge_budget_gate = forge_budget_gate
+
+    @staticmethod
+    def _mutate_assert_eq_neutralized(source: str) -> str:
+        """
+        assertEq(a, b) -> assertEq(a, a)
+
+        Turns the assertion into a tautology that always passes.
+        If the surrounding test still passes afterwards, the
+        assertion was not contributing to the outcome.
+        """
+        return re.sub(
+            r"assertEq\(([^,\n]+),\s*([^),\n]+)\)",
+            r"assertEq(\1, \1)",
+            source,
+            count=1,
+        )
+
+    @staticmethod
+    def _mutate_assert_true_flipped(source: str) -> str:
+        """
+        assertTrue(expr) -> assertTrue(!(expr))
+
+        Inverts the boolean expectation. A test that genuinely
+        depends on assertTrue succeeding should now fail.
+        """
+        return re.sub(
+            r"assertTrue\(([^)\n]+)\)",
+            r"assertTrue(!(\1))",
+            source,
+            count=1,
+        )
 
     @staticmethod
     def _classify_mutation(
@@ -1522,6 +2172,7 @@ class MutationTester:
         shadow = sandbox_root / "project"
 
         try:
+            reject_symlinks_tree(project)
             shutil.copytree(
                 project,
                 shadow,
@@ -1537,19 +2188,12 @@ class MutationTester:
 
             mutations = [
                 (
-                    "eq_operand_swap",
-                    lambda s: re.sub(
-                        r"assertEq\(([^,\n]+),\s*([^)]+)\)",
-                        r"assertEq(\2, \1)",
-                        s,
-                        count=1,
-                    ),
+                    "assert_eq_neutralized",
+                    self._mutate_assert_eq_neutralized,
                 ),
                 (
-                    "true_to_false",
-                    lambda s: s.replace(
-                        "assertTrue(", "assertFalse(", 1
-                    ),
+                    "assert_true_flipped",
+                    self._mutate_assert_true_flipped,
                 ),
             ]
 
@@ -1570,7 +2214,24 @@ class MutationTester:
                     shadow_test.write_text(
                         mutated, encoding="utf-8"
                     )
-                    run = self.runner.run(shadow, match_test)
+                    if self.forge_budget_gate is not None:
+                        budget_error = self.forge_budget_gate()
+                        if budget_error:
+                            results.append({
+                                "mutation": name,
+                                "status": "BUDGET_EXHAUSTED",
+                                "result_type": "BUDGET_EXHAUSTED",
+                                "error": budget_error,
+                            })
+                            shadow_test.write_text(
+                                original, encoding="utf-8"
+                            )
+                            break
+                    run = self.runner.run(
+                        shadow,
+                        match_test,
+                        str(rel).replace("\\", "/"),
+                    )
                     results.append({
                         "mutation": name,
                         "status": self._classify_mutation(run),
@@ -1582,16 +2243,25 @@ class MutationTester:
             finally:
                 self.runner.timeout = original_timeout
 
+            # Only mutations that were actually executed count
+            # toward the score. NOT_APPLICABLE and BUDGET_EXHAUSTED
+            # are both excluded; the latter is surfaced separately.
             applicable = [
                 r for r in results
-                if r["status"] != "NOT_APPLICABLE"
+                if r["status"] not in MUTATION_NON_APPLICABLE
+            ]
+            budget_skipped = [
+                r for r in results
+                if r["status"] == "BUDGET_EXHAUSTED"
             ]
             strong_kills = [
                 r for r in applicable
                 if r["status"] in MUTATION_STRONG_KILLS
             ]
 
-            if not applicable:
+            if not applicable and budget_skipped:
+                status = "BUDGET_EXHAUSTED"
+            elif not applicable:
                 status = "NOT_APPLICABLE"
             elif len(strong_kills) == len(applicable):
                 status = "STRONG"
@@ -1604,12 +2274,14 @@ class MutationTester:
                 "status": status,
                 "strong_kills": len(strong_kills),
                 "applicable": len(applicable),
+                "budget_skipped": len(budget_skipped),
                 "results": results,
                 "note": (
                     "Mutation is a test-quality signal, "
                     "not proof of a vulnerability. Only "
                     "KILLED_BY_ASSERTION and KILLED_BY_TEST_FAILURE "
-                    "count as strong kills."
+                    "count as strong kills. BUDGET_EXHAUSTED "
+                    "mutations are excluded from the score."
                 ),
             }
         except Exception as exc:
@@ -1652,12 +2324,17 @@ class SecurityAnalysisServices:
             project=self.project,
             max_bytes=config.max_test_file_bytes,
         )
+        # Resolve forge once. All subprocess invocations use
+        # this absolute path so PATH cannot shift under us
+        # between preflight and the actual run.
+        self.forge_executable = shutil.which("forge")
         self.forge = ForgeTestRunner(
             root=self.root,
             timeout=config.forge_timeout,
             fuzz_runs=config.fuzz_runs,
             max_output_chars=config.max_output_chars,
             max_evidence_items=config.max_evidence_items,
+            forge_executable=self.forge_executable,
         )
         self.evidence = EvidenceStore(
             pipeline_dir,
@@ -1669,8 +2346,14 @@ class SecurityAnalysisServices:
         self.mutator = MutationTester(
             self.forge,
             timeout=config.mutation_timeout,
+            forge_budget_gate=self.budget.consume_forge_execution,
         )
         self.confidences: Dict[str, FindingConfidence] = {}
+        # Per-hypothesis test_mode, set at write time and read at
+        # run time so TEST_PASS vs TEST_FAILURE is interpreted
+        # against the intended property semantics.
+        self.test_modes: Dict[str, str] = {}
+        self.test_bindings: Dict[str, Dict[str, str]] = {}
 
     # ---- JSON helper ----
 
@@ -1757,7 +2440,11 @@ class SecurityAnalysisServices:
                 "error": str(exc),
             })
         conf = self._ensure_confidence(hypothesis_id)
-        return self._json(conf.model_dump())
+        payload = conf.model_dump()
+        payload["test_mode"] = self.test_modes.get(
+            hypothesis_id, "INVARIANT_MUST_HOLD"
+        )
+        return self._json(payload)
 
     # ---- Write ----
 
@@ -1767,6 +2454,10 @@ class SecurityAnalysisServices:
         relative_path: str,
         content: str,
         property_text: str = "",
+        test_mode: str = "INVARIANT_MUST_HOLD",
+        test_name: Optional[str] = None,
+        target_contract: Optional[str] = None,
+        target_function: Optional[str] = None,
     ) -> str:
         try:
             hypothesis_id = validate_hypothesis_id(
@@ -1779,34 +2470,155 @@ class SecurityAnalysisServices:
                 "error": str(exc),
             })
 
+        try:
+            test_name = validate_test_name(test_name)
+        except ValueError as exc:
+            return self._json({
+                "success": False,
+                "result_type": "INPUT_ERROR",
+                "error": f"test_name is required and must be valid: {exc}",
+            })
+        if test_name is None:
+            return self._json({
+                "success": False,
+                "result_type": "INPUT_ERROR",
+                "error": "test_name is required to bind a hypothesis to exactly one generated test.",
+            })
+
+        if test_mode not in {
+            "INVARIANT_MUST_HOLD",
+            "PROPERTY_HOLDS_ON_PASS",
+        }:
+            return self._json({
+                "success": False,
+                "result_type": "INPUT_ERROR",
+                "error": (
+                    "test_mode must be INVARIANT_MUST_HOLD or "
+                    "PROPERTY_HOLDS_ON_PASS."
+                ),
+            })
+
+        # Contract scope check. The LLM must declare which
+        # contract and function the hypothesis targets, and
+        # those names must actually exist in the scanned
+        # source. This blocks writing tests for functions
+        # that were hallucinated or renamed.
+        if (
+            not target_contract
+            or not target_function
+            or not _TEST_NAME_RE.fullmatch(str(target_contract))
+            or not _TEST_NAME_RE.fullmatch(str(target_function))
+        ):
+            return self._json({
+                "success": False,
+                "result_type": "TARGET_INVALID",
+                "error": (
+                    "target_contract and target_function are "
+                    "required and must be Solidity identifiers."
+                ),
+            })
+        if not self.slicer.contract_exists(str(target_contract)):
+            return self._json({
+                "success": False,
+                "result_type": "TARGET_CONTRACT_NOT_FOUND",
+                "error": (
+                    f"Contract {target_contract!r} was not "
+                    f"found in the scanned source."
+                ),
+                "target_contract": target_contract,
+            })
+        if not self.slicer.function_exists(
+            str(target_contract), str(target_function)
+        ):
+            return self._json({
+                "success": False,
+                "result_type": "TARGET_FUNCTION_NOT_FOUND",
+                "error": (
+                    f"Function {target_function!r} was not "
+                    f"found on {target_contract!r}."
+                ),
+                "target_contract": target_contract,
+                "target_function": target_function,
+            })
+
+        if hypothesis_id in self.test_bindings:
+            return self._json({
+                "success": False,
+                "result_type": "TEST_ALREADY_BOUND",
+                "error": (
+                    "This hypothesis is already bound to a generated test. "
+                    "Create a new hypothesis_id rather than rebinding evidence."
+                ),
+                "binding": self.test_bindings[hypothesis_id],
+            })
+
+        clean_relative = relative_path.replace("\\", "/").lstrip("/")
+
+        # NOTE: fingerprint signature is (test_file, test_name, property_text).
+        # Passing four positional arguments here was the crash this build fixes.
         fingerprint = self.scope.fingerprint(
-            hypothesis_id,
-            Path(relative_path).name,
+            clean_relative,
+            test_name,
             property_text,
         )
         duplicate = self.scope.lookup(fingerprint)
 
-        budget_error = self.budget.consume_write()
-        if budget_error:
-            return self._json({
-                "success": False,
-                "result_type": "BUDGET_EXHAUSTED",
-                "error": budget_error,
-            })
-
-        result = self.writer.write(relative_path, content)
-        result["hypothesis_id"] = hypothesis_id
-        result["duplicate_warning"] = bool(duplicate)
         if duplicate:
-            result["existing_record"] = duplicate
-        else:
-            self.scope.record(fingerprint, {
+            result = {
+                "success": False,
+                "result_type": "DUPLICATE_TEST",
                 "hypothesis_id": hypothesis_id,
-                "test_file": relative_path,
-                "created_at": int(time.time()),
-            })
+                "test_mode": test_mode,
+                "duplicate_warning": True,
+                "existing_record": duplicate,
+            }
+        else:
+            budget_error = self.budget.consume_write()
+            if budget_error:
+                return self._json({
+                    "success": False,
+                    "result_type": "BUDGET_EXHAUSTED",
+                    "error": budget_error,
+                })
+
+            result = self.writer.write(relative_path, content)
+            result["hypothesis_id"] = hypothesis_id
+            result["test_mode"] = test_mode
+            result["test_name"] = test_name
+            result["target_contract"] = str(target_contract)
+            result["target_function"] = str(target_function)
+            result["duplicate_warning"] = False
+
+            # The registry is transactional: only a successful on-disk
+            # write creates a durable duplicate record.
+            if result.get("success"):
+                self.scope.record(fingerprint, {
+                    "hypothesis_id": hypothesis_id,
+                    "test_file": relative_path,
+                    "test_mode": test_mode,
+                    "test_name": test_name,
+                    "target_contract": str(target_contract),
+                    "target_function": str(target_function),
+                    "created_at": int(time.time()),
+                })
 
         if result.get("success"):
+            # A successfully written test implies the pipeline's
+            # earlier stages have been satisfied for this hypothesis:
+            # the source was read, it was reachable enough to test,
+            # and the invariant is now encoded in the test itself.
+            # Advancing these stages explicitly keeps the evidence
+            # ladder meaningful beyond HYPOTHESIS_ONLY.
+            for stage in ("SOURCE", "REACHABILITY", "INVARIANT"):
+                self._advance_confidence(hypothesis_id, stage)
+
+            self.test_modes[hypothesis_id] = test_mode
+            self.test_bindings[hypothesis_id] = {
+                "test_file": clean_relative,
+                "test_name": test_name,
+                "target_contract": str(target_contract),
+                "target_function": str(target_function),
+            }
             self._advance_confidence(
                 hypothesis_id, "TEST_WRITTEN"
             )
@@ -1842,6 +2654,45 @@ class SecurityAnalysisServices:
                 "error": str(exc),
             })
 
+        binding = self.test_bindings.get(hypothesis_id)
+        if not binding:
+            return self._json({
+                "success": False,
+                "result_type": "TEST_NOT_BOUND",
+                "error": (
+                    "No successfully written test is bound to this hypothesis. "
+                    "Call Write Authorized Foundry Test first."
+                ),
+            })
+
+        bound_file = self.project / binding["test_file"]
+        try:
+            bound_file = resolve_inside_root(bound_file, self.project)
+            reject_symlink_components(bound_file, self.project)
+        except ValueError as exc:
+            return self._json({
+                "success": False,
+                "result_type": "TEST_BINDING_INVALID",
+                "error": str(exc),
+            })
+        if not bound_file.is_file() or bound_file.is_symlink():
+            return self._json({
+                "success": False,
+                "result_type": "TEST_BINDING_INVALID",
+                "error": "The bound generated test file no longer exists safely on disk.",
+            })
+        if match_test and match_test != binding["test_name"]:
+            return self._json({
+                "success": False,
+                "result_type": "TEST_BINDING_MISMATCH",
+                "error": (
+                    f"Requested test {match_test!r} does not match bound test "
+                    f"{binding['test_name']!r}."
+                ),
+            })
+
+        match_test = binding["test_name"]
+
         budget_error = self.budget.consume_forge(
             hypothesis_id
         )
@@ -1852,44 +2703,81 @@ class SecurityAnalysisServices:
                 "error": budget_error,
             })
 
+        # Test mode and test identity are taken only from the
+        # successful write record. The forge execution cannot be
+        # redirected to an unrelated test by the agent.
+        test_mode = self.test_modes[hypothesis_id]
+        test_mode_source = "recorded"
+
         before = WorkspaceIntegrity.snapshot(self.project)
-        lock = ReproducibilityLock.collect(self.project)
-        result = self.forge.run(self.project, match_test)
+        lock = ReproducibilityLock.collect(self.project, self.forge_executable)
+        result = self.forge.run(
+            self.project,
+            match_test,
+            binding["test_file"],
+        )
         after = WorkspaceIntegrity.snapshot(self.project)
         tampered = before != after
+        snapshot_unverified = (
+            "__truncated__" in before
+            or "__truncated__" in after
+        )
 
         result["hypothesis_id"] = hypothesis_id
+        result["test_mode"] = test_mode
+        result["test_mode_source"] = test_mode_source
+        result["bound_test_file"] = binding["test_file"]
+        result["bound_test_name"] = binding["test_name"]
         result["reproducibility"] = lock
+        integrity_status = (
+            "WORKSPACE_TAMPERED" if tampered
+            else "INTEGRITY_UNVERIFIED" if snapshot_unverified
+            else "OK"
+        )
         result["workspace_integrity"] = {
             "before_after_match": not tampered,
-            "status":
-                "WORKSPACE_TAMPERED" if tampered else "OK",
+            "snapshot_complete": not snapshot_unverified,
+            "status": integrity_status,
         }
         if tampered:
             result["success"] = False
             result["result_type"] = "WORKSPACE_TAMPERED"
 
-        # Evidence-status flags (kept flat so the reporter can
-        # cross-check without parsing the ladder).
         rt = result.get("result_type")
+
+        # Positive-signal determination depends on the intended
+        # semantics of the test.
+        invariant_signal = (
+            test_mode == "INVARIANT_MUST_HOLD"
+            and rt == "TEST_FAILURE"
+        )
+        property_signal = (
+            test_mode == "PROPERTY_HOLDS_ON_PASS"
+            and rt == "TEST_PASS"
+        )
+
         result["evidence_status"] = {
             "LOCAL_TEST_EXECUTED":
                 rt in {"TEST_PASS", "TEST_FAILURE"},
-            "COMPILATION_OK":
-                rt != "COMPILATION_ERROR",
-            "INVARIANT_SIGNAL": rt == "TEST_FAILURE",
+            "COMPILATION_OK": (
+                True if rt in {"TEST_PASS", "TEST_FAILURE"}
+                else False if rt == "COMPILATION_ERROR"
+                else None
+            ),
+            "COMPILATION_STATUS": (
+                "OK" if rt in {"TEST_PASS", "TEST_FAILURE"}
+                else "FAILED" if rt == "COMPILATION_ERROR"
+                else "UNKNOWN"
+            ),
+            "INVARIANT_SIGNAL": invariant_signal,
+            "PROPERTY_SIGNAL": property_signal,
         }
 
-        # Advance the confidence ladder.
         if rt in {"TEST_PASS", "TEST_FAILURE"}:
             self._advance_confidence(
                 hypothesis_id, "TEST_EXECUTED"
             )
-        # Default test_mode is INVARIANT_MUST_HOLD, where
-        # TEST_FAILURE is the positive signal. The reporter
-        # is expected to reconcile this against the spec's
-        # test_mode if it differs.
-        if rt == "TEST_FAILURE":
+        if invariant_signal or property_signal:
             self._advance_confidence(
                 hypothesis_id, "TEST_VALIDATED"
             )
@@ -1942,6 +2830,27 @@ class SecurityAnalysisServices:
                 "error": str(exc),
             })
 
+        binding = self.test_bindings.get(hypothesis_id)
+        if not binding:
+            return self._json({
+                "success": False,
+                "result_type": "TEST_NOT_BOUND",
+                "error": "No successfully written test is bound to this hypothesis.",
+            })
+        if test_file.replace("\\", "/").lstrip("/") != binding["test_file"]:
+            return self._json({
+                "success": False,
+                "result_type": "TEST_BINDING_MISMATCH",
+                "error": "test_file does not match the hypothesis-bound generated test.",
+            })
+        if match_test and match_test != binding["test_name"]:
+            return self._json({
+                "success": False,
+                "result_type": "TEST_BINDING_MISMATCH",
+                "error": "match_test does not match the hypothesis-bound generated test.",
+            })
+        match_test = binding["test_name"]
+
         budget_error = self.budget.consume_mutation()
         if budget_error:
             return self._json({
@@ -1964,9 +2873,13 @@ class SecurityAnalysisServices:
         result["hypothesis_id"] = hypothesis_id
 
         if result.get("status") == "STRONG":
-            self._advance_confidence(
-                hypothesis_id, "MUTATION_KILLED"
-            )
+            # mutation_killed is a separate test-quality signal,
+            # not part of the vulnerability ladder. Set the flag
+            # and persist; do not imply a ladder stage.
+            conf = self._ensure_confidence(hypothesis_id)
+            if not conf.mutation_killed:
+                conf.mutation_killed = True
+                self._persist_confidence(hypothesis_id)
 
         artifact = self.evidence.write_hypothesis_json(
             hypothesis_id,
@@ -1974,8 +2887,14 @@ class SecurityAnalysisServices:
             result,
         )
         result["evidence_artifact"] = artifact
-        result["success"] = result.get("status") not in {
-            "ERROR", "REJECTED",
+        mutation_status = str(result.get("status", "UNKNOWN"))
+        result["tool_ok"] = mutation_status not in {
+            "ERROR", "REJECTED", "UNKNOWN",
+        }
+        result["success"] = mutation_status in {
+            "STRONG",
+            "PARTIAL_KILL",
+            "ALL_SURVIVED_OR_INCONCLUSIVE",
         }
         result["result_type"] = (
             "MUTATION_" + str(result.get("status", "UNKNOWN"))
@@ -2019,10 +2938,26 @@ class SecurityAnalysisServices:
             self.project
         )
 
-        # forge binary.
+        # Reuse the path resolved at service init. If forge
+        # was not on PATH then, try once more here so a user
+        # who installed Foundry mid-session still passes.
+        forge_executable = self.forge_executable
+        if not forge_executable:
+            forge_executable = shutil.which("forge")
+            if forge_executable:
+                self.forge_executable = forge_executable
+                self.forge.forge_executable = forge_executable
+        result["forge_executable"] = forge_executable
+        if not forge_executable:
+            result["checks"]["forge"] = False
+            result["forge_version_error"] = (
+                "forge executable was not found in PATH."
+            )
+            result["ready"] = False
+            return result
         try:
             proc = subprocess.run(
-                ["forge", "--version"],
+                [forge_executable, "--version"],
                 env=build_sanitized_env(),
                 capture_output=True,
                 text=True,
@@ -2042,13 +2977,17 @@ class SecurityAnalysisServices:
         # forge-std is a hard gate. Without it, generated tests
         # that import "forge-std/Test.sol" cannot compile, and
         # the crew would burn tokens for nothing.
-        forge_std_candidates = (
-            self.project / "lib" / "forge-std" / "src" / "Test.sol",
-            self.project / "lib" / "forge-std" / "Test.sol",
+        forge_std_path = find_forge_std(self.project)
+        result["checks"]["forge_std"] = (
+            forge_std_path is not None
         )
-        result["checks"]["forge_std"] = any(
-            p.is_file() for p in forge_std_candidates
-        )
+        if forge_std_path is not None:
+            try:
+                result["forge_std_path"] = str(
+                    forge_std_path.relative_to(self.project)
+                )
+            except ValueError:
+                result["forge_std_path"] = str(forge_std_path)
 
         result["ready"] = (
             all(result["checks"].values())
@@ -2059,7 +2998,7 @@ class SecurityAnalysisServices:
             self.evidence.write_json("preflight.json", {
                 "preflight": "PASS",
                 "reproducibility": ReproducibilityLock.collect(
-                    self.project
+                    self.project, self.forge_executable
                 ),
                 "config_audit": result["config_audit"],
                 "warnings": result["config_audit"].get(
@@ -2096,6 +3035,31 @@ class WriteTestInput(BaseModel):
     relative_path: str
     content: str
     property_text: str = ""
+    test_name: str
+    target_contract: str = Field(
+        ...,
+        description=(
+            "Exact Solidity contract name the hypothesis "
+            "targets. Must exist in the scanned source."
+        ),
+    )
+    target_function: str = Field(
+        ...,
+        description=(
+            "Exact function name on target_contract that the "
+            "invariant is about. Must exist in the scanned "
+            "source."
+        ),
+    )
+    test_mode: str = Field(
+        default="INVARIANT_MUST_HOLD",
+        description=(
+            "INVARIANT_MUST_HOLD: TEST_FAILURE is the positive "
+            "signal. PROPERTY_HOLDS_ON_PASS: TEST_PASS is the "
+            "positive signal. This must match the spec produced "
+            "by the invariant engineer."
+        ),
+    )
 
 
 class ForgeTestInput(BaseModel):
@@ -2138,7 +3102,8 @@ class ReadAuthorizedFileTool(BaseTool):
 class ListAuthorizedFilesTool(BaseTool):
     name: str = "List Authorized Solidity Files"
     description: str = (
-        "List files inside the authorized workspace. Read-only."
+        "List files inside the authorized workspace. Read-only. "
+        "Vendor and cache directories are hidden."
     )
     args_schema: type[BaseModel] = PathInput
     _services: SecurityAnalysisServices = PrivateAttr()
@@ -2160,7 +3125,8 @@ class SearchAuthorizedSourceTool(BaseTool):
     description: str = (
         "Bounded source search to locate relevant Solidity files. "
         "Treats input as a literal substring unless prefixed "
-        "with 're:'. Slice-lite, not a full program slice."
+        "with 're:'. Slice-lite, not a full program slice. "
+        "Vendor and cache directories are hidden."
     )
     args_schema: type[BaseModel] = SearchInput
     _services: SecurityAnalysisServices = PrivateAttr()
@@ -2181,7 +3147,11 @@ class WriteAuthorizedTestTool(BaseTool):
     name: str = "Write Authorized Foundry Test"
     description: str = (
         "Create a new .t.sol file under test/security_pipeline/. "
-        "Existing files cannot be overwritten."
+        "Existing files cannot be overwritten. Must specify test_name, "
+        "target_contract, target_function, and test_mode. The pipeline "
+        "verifies the target contract and function actually exist in "
+        "the scanned source before writing. A hypothesis is bound to "
+        "the exact generated test it successfully writes."
     )
     args_schema: type[BaseModel] = WriteTestInput
     _services: SecurityAnalysisServices = PrivateAttr()
@@ -2200,10 +3170,15 @@ class WriteAuthorizedTestTool(BaseTool):
         relative_path: str,
         content: str,
         property_text: str = "",
+        test_name: str = "",
+        test_mode: str = "INVARIANT_MUST_HOLD",
+        target_contract: str = "",
+        target_function: str = "",
     ) -> str:
         return self._services.write_test(
             hypothesis_id, relative_path, content,
-            property_text,
+            property_text, test_mode, test_name,
+            target_contract, target_function,
         )
 
 
@@ -2268,8 +3243,9 @@ class MutationCheckTool(BaseTool):
 class ConfidenceTool(BaseTool):
     name: str = "Get Finding Confidence Ladder"
     description: str = (
-        "Return the evidence-status ladder for a hypothesis. "
-        "This is a stage status, not a numeric confidence score."
+        "Return the evidence-status ladder for a hypothesis, "
+        "including the recorded test_mode. This is a stage "
+        "status, not a numeric confidence score."
     )
     args_schema: type[BaseModel] = ConfidenceInput
     _services: SecurityAnalysisServices = PrivateAttr()
@@ -2385,13 +3361,17 @@ class SoliditySecurityCrew:
             role="Smart Contract Invariant Engineer",
             goal=(
                 "Convert hypotheses into structured Foundry "
-                "invariant specifications."
+                "invariant specifications that are grounded "
+                "in the actual source signatures."
             ),
             backstory=(
-                "You design property tests for accounting, "
+                "You verify function signatures and state "
+                "variables against source before writing a "
+                "spec. You design property tests for accounting, "
                 "solvency, authorization and multi-step state "
                 "transitions. You do not write exploit payloads."
             ),
+            tools=[read_tool, search_tool],
             **common,
         )
         self.critic = Agent(
@@ -2428,7 +3408,12 @@ class SoliditySecurityCrew:
             backstory=(
                 "You never use OS commands. Tool errors are "
                 "not vulnerabilities. Mutation results measure "
-                "test quality only."
+                "test quality only. You pass the recorded "
+                "test_mode to the write tool so that the "
+                "pipeline interprets the result correctly. "
+                "You pass target_contract and target_function "
+                "so the pipeline can verify the target actually "
+                "exists in the scanned source."
             ),
             tools=[
                 read_tool, write_tool,
@@ -2504,10 +3489,22 @@ Do not use TEST_VALIDATED here.
             description="""
 Convert surviving hypotheses to TestSpecificationList.
 
+Before writing any spec, use the read/search tools to confirm
+the actual contract name, function signature, state variables
+and Solidity version referenced by the hypothesis. If the
+hypothesis names something that does not exist in the source,
+either correct it against the source or drop the hypothesis.
+
 Rules:
 - hypothesis_id like HYP-001
 - test_name is a Solidity identifier, preferably test_HYP001_<property>
 - test_file under test/security_pipeline/ and ends with .t.sol
+- target_contract is the exact contract name the hypothesis is about,
+  e.g. PoolManager. It MUST be a contract that exists in the source.
+- target_function is the exact function name on that contract,
+  e.g. swap. It MUST exist on target_contract in the source.
+  If you cannot confirm both with the read/search tools, drop the
+  hypothesis instead of guessing a name.
 - test_mode must be one of:
     INVARIANT_MUST_HOLD    -> TEST_FAILURE is the positive signal
                               (invariant violated by buggy code).
@@ -2565,14 +3562,29 @@ Write only new files under test/security_pipeline/.
 Pass the same hypothesis_id to write, forge, mutation and
 confidence tools.
 
-Interpret result_type with respect to test_mode:
+IMPORTANT — pass test_mode to the Write Authorized Foundry Test
+tool. It must match the test_mode declared in the invariant
+specification for that hypothesis. The pipeline records this
+mode and uses it later to interpret TEST_PASS vs TEST_FAILURE
+correctly. If the mode is omitted, the pipeline falls back to
+INVARIANT_MUST_HOLD and the result may be misinterpreted.
 
-  If test_mode == INVARIANT_MUST_HOLD:
+IMPORTANT — pass target_contract and target_function to the
+Write Authorized Foundry Test tool. They must name a contract
+and a function that actually exist in the scanned source. The
+pipeline verifies both before writing the test file. If either
+is missing or not found, the write is refused with
+TARGET_CONTRACT_NOT_FOUND / TARGET_FUNCTION_NOT_FOUND, and no
+budget is consumed for the retry until the target is fixed.
+
+Interpret result_type with respect to the recorded test_mode:
+
+  test_mode == INVARIANT_MUST_HOLD:
     TEST_FAILURE  -> consistent with the claimed invariant
                      breaking in the buggy code.
     TEST_PASS     -> invariant held; hypothesis NOT supported.
 
-  If test_mode == PROPERTY_HOLDS_ON_PASS:
+  test_mode == PROPERTY_HOLDS_ON_PASS:
     TEST_PASS     -> secure property holds; may support the
                      hypothesis as a security verification.
     TEST_FAILURE  -> property failed; hypothesis NOT supported
@@ -2586,9 +3598,11 @@ Mutation statuses:
   STRONG                          -> strong test-quality signal
   PARTIAL_KILL                    -> mixed
   ALL_SURVIVED_OR_INCONCLUSIVE    -> weak test-quality signal
+  BUDGET_EXHAUSTED                -> not enough forge budget to run
 Only KILLED_BY_ASSERTION and KILLED_BY_TEST_FAILURE count as
 strong kills. KILLED_BY_COMPILATION_ERROR does not prove the
-mutant was caught semantically.
+mutant was caught semantically. BUDGET_EXHAUSTED mutations are
+excluded from the score.
 
 Retry compilation errors only while budget remains.
 Do not retry path, timeout, missing forge, or tamper results.
@@ -2596,6 +3610,7 @@ Do not retry path, timeout, missing forge, or tamper results.
 Report per hypothesis:
 - hypothesis_id
 - test_name and test_mode (from the invariant spec)
+- target_contract and target_function
 - result_type
 - passed / failed / skipped counts
 - parser mode and validity
@@ -2622,7 +3637,7 @@ TEST_VALIDATION.
 
 For each finding include:
 - hypothesis_id
-- contract / function
+- contract / function (target_contract, target_function)
 - root cause
 - violated invariant
 - test specification (including test_mode)
