@@ -1,9 +1,17 @@
 """
-pipeline_final.py (v2)
+pipeline_final.py
 
 Authorized Solidity / Foundry security analysis pipeline.
 
-8 reasoning agents. Maturity is deterministic control, not extra LLMs:
+Patch markers in this docstring (v2 / v3 / v4) label WHEN a control was
+added, not a release number. Everything listed below exists in the
+current code.
+
+11 reasoning agents / 14 sequential tasks: the 8 original roles, plus a
+debate round (Vulnerability Debator -> Vulnerability Skeptic ->
+Hypothesis Judge), plus a follow-up round that reuses the deep-dive,
+invariant and validation agents. Maturity is deterministic control,
+not extra LLMs:
 
   1. Scope / duplicate registry (wired into write_test)
   2. Bounded list / read / search  (slice-lite)
@@ -11,6 +19,10 @@ Authorized Solidity / Foundry security analysis pipeline.
   4. Workspace integrity snapshots
   5. Bounded mutation checks on generated tests only
   6. Finding confidence as an evidence ladder (not a score)
+  7. Patch-differential confirmation on a sandbox copy (v3)
+  8. Deterministic bounty eligibility gate, fail-closed (v4)
+  9. Static prepass (slither / aderyn) + modern surface scanner (v2)
+ 10. Anti-pseudo test validation + structural PoC validation (v2)
 
 Hard controls:
   - no shell=True
@@ -78,6 +90,17 @@ v3 addenda (bounty-grade evidence):
     a stable id. Reports without the revision are unverifiable.
   - budget: max_patch_runs (--max-patch-runs). Refusals (bad
     diff, unsafe path, off-contract target) cost no budget.
+
+v4 addenda (fail-closed eligibility):
+  - BountyEligibilityGate consumes DETERMINISTIC EVIDENCE ONLY:
+    source-level authz scans, PoC role-grant scans, judge verdicts,
+    patch-differential verdicts, and artifact reconciliation.
+  - poc_validated / integrity_ok in the gating JSON are CLAIMS to be
+    checked, never evidence.
+  - Judge verdict is enforced: a missing verdict, or anything other
+    than BUG_VALIDATED, downgrades the finding.
+  - impact_type must be a direct fund-loss or permanent-lock category.
+  - Reconciliation failure forces NON_REPORTABLE.
 
 Portability:
   - Agent kwargs are filtered against the installed CrewAI Agent.
@@ -447,7 +470,9 @@ def _looks_catastrophic(pattern: str) -> bool:
         return True
     if re.search(r"\([^()]*\|[^()]*\)\s*[+*{]", pattern):
         return True
-    if re.search(r"\([^()]*\{\d+,\d*\}[^()]*\)\s*\{", pattern):
+    # PATCH (v5): the quantifier after the group may be `{`, `+` or
+    # `*` — `(a{1,})+` backtracks exponentially but used to pass.
+    if re.search(r"\([^()]*\{\d+,\d*\}[^()]*\)\s*[+*{]", pattern):
         return True
     return False
 
@@ -565,18 +590,45 @@ def resolve_inside_root(path: str | Path, root: Path) -> Path:
 
 
 def reject_symlink_components(path: Path, root: Path) -> None:
-    root = root.resolve()
-    path = Path(path)
+    """Reject a path that escapes `root` or that traverses a symlink.
+
+    PATCH (v5): containment is a property of the RESOLVED path, but
+    symlink detection must use the path AS GIVEN. Resolving first
+    (the old behaviour) replaced the symlink with its target, so the
+    per-component `is_symlink()` loop could never fire for a symlink
+    that resolves inside `root` — e.g. `test/security_pipeline ->
+    ../src` silently redirected every generated test into `src/`,
+    defeating the "tests only under test/security_pipeline/"
+    control. Callers that need the check to bite must pass the
+    unresolved path.
+    """
+    root = Path(root).expanduser().resolve()
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+
+    # 1. containment, evaluated on the resolved path
     try:
-        relative = path.resolve(strict=False).relative_to(root)
-    except ValueError as exc:
+        candidate.resolve(strict=False).relative_to(root)
+    except (ValueError, OSError) as exc:
         raise ValueError(
             f"Path escapes authorized root: {path}"
         ) from exc
+
+    # 2. symlink detection, evaluated on the path as given
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Path escapes authorized root: {candidate}"
+        ) from exc
+
     current = root
     for component in relative.parts:
+        if component in ("", "."):
+            continue
         current = current / component
-        if current.is_symlink():
+        if os.path.islink(current):
             raise ValueError(
                 f"Symlink path is not permitted: {current}"
             )
@@ -750,13 +802,23 @@ _CONTRACT_DECL_RE = re.compile(
 )
 
 
-def _mask_comments_and_strings(text: str) -> str:
-    """Return `text` with comments and string literals blanked out
-    to spaces (newline preserving, so offsets are unchanged).
+def _mask_comments_and_strings(
+    text: str,
+    mask_strings: bool = True,
+) -> str:
+    """Return `text` with comments (and, by default, string
+    literals) blanked out to spaces — newline preserving, so
+    offsets are unchanged.
 
     Brace counting and marker scanning then cannot be fooled by a
     `}` inside a comment/string or by an identifier that only
     appears in a comment (e.g. "// authority check removed").
+
+    PATCH (v5): `mask_strings=False` keeps string literals intact.
+    Callers that must still see a literal (e.g. the
+    `import ... "forge-std/Test.sol"` check) pass it; every other
+    content check uses the masked form so a comment cannot fake
+    code.
     """
     out = list(text)
     i = 0
@@ -780,6 +842,9 @@ def _mask_comments_and_strings(text: str) -> str:
                     out[i] = " "
                 i += 1
         elif ch in ('"', "'"):
+            if not mask_strings:
+                i += 1
+                continue
             quote = ch
             out[i] = " "
             i += 1
@@ -798,6 +863,26 @@ def _mask_comments_and_strings(text: str) -> str:
         else:
             i += 1
     return "".join(out)
+
+
+def _snapshot_name_pattern(fragments) -> str:
+    """Regex for an identifier that contains one of `fragments` at a
+    REAL word boundary: at the start of the name, right after an
+    underscore, or capitalised inside a camelCase name.
+
+    PATCH (v5): used by ExploitPoCValidator. A plain
+    ``\w*(?:pre)\w*`` also matches `spread`, which made a variable
+    that is not a before/after snapshot satisfy the check.
+    """
+    lower = "|".join(re.escape(f) for f in fragments)
+    caps = "|".join(
+        re.escape(f[:1].upper() + f[1:]) for f in fragments
+    )
+    return (
+        r"(?:(?:[A-Za-z0-9_]*_)?(?:" + lower + r"|" + caps + r")"
+        r"[A-Za-z0-9_]*"
+        r"|[A-Za-z0-9]*[a-z0-9](?:" + caps + r")[A-Za-z0-9_]*)"
+    )
 
 
 def _function_decl_pattern(name: str) -> str:
@@ -945,12 +1030,29 @@ def _load_sol_index(root: Path, max_read_bytes: int):
     return entries, bases_map
 
 
+# PATCH (v5): operator idioms are matched with flexible
+# whitespace. As literals, "msg.sender ==" only matched the
+# single-spaced spelling, so `msg.sender==owner` and
+# `msg.sender  ==  owner` were not reported as an authorization
+# boundary — the gate then treated a genuinely guarded function as
+# a zero-privilege path.
+_WHITESPACE_FLEX_IDIOMS = {
+    "msg.sender ==": r"msg\.sender\s*==",
+    "tx.origin ==": r"tx\.origin\s*==",
+}
+
+
 def _idiom_matches(idiom: str, masked_src: str) -> bool:
     """Word-aware idiom match on comment/string-free source.
 
     `authority` must not match `authorityFee`, while `_isStrategy(`
-    must still match `_isStrategy(msg.sender)`.
+    must still match `_isStrategy(msg.sender)`. Operator idioms are
+    matched with flexible whitespace (see
+    `_WHITESPACE_FLEX_IDIOMS`).
     """
+    flexible = _WHITESPACE_FLEX_IDIOMS.get(idiom)
+    if flexible is not None:
+        return re.search(flexible, masked_src) is not None
     if idiom and idiom[-1].isalnum():
         return (
             re.search(re.escape(idiom) + r"\b", masked_src)
@@ -1035,7 +1137,13 @@ def detect_role_grant_to_attacker(content: str) -> List[str]:
     """Find admin-style role grants handed to an attacker-named
     account in a PoC. Negative tests (expectRevert) are ignored."""
     hits: List[str] = []
-    flat = re.sub(r"\s+", " ", content)
+    # PATCH (v5): strip comments before looking for the negative-test
+    # marker. The old substring test ran over raw text, so a comment
+    # such as "// no expectRevert needed" — or an unrelated earlier
+    # statement — silently suppressed a real admin grant to the
+    # attacker account (fail-open on the PoC role-grant guard).
+    scanned = _mask_comments_and_strings(content)
+    flat = re.sub(r"\s+", " ", scanned)
     for m in _ROLE_GRANT_TO_ATTACKER_RE.finditer(flat):
         before = flat[max(0, m.start() - 160): m.start()]
         if "expectRevert" in before:
@@ -1155,6 +1263,17 @@ class ValidationBudget:
             )
         self.writes_used += 1
         return None
+
+    def refund_write(self) -> None:
+        """Give back a consumed test-write slot.
+
+        PATCH (v5): the write budget is consumed before the file is
+        created, so a refused write (path guard, overwrite refusal,
+        I/O error) used to burn a slot for nothing — the same
+        "refusals must not burn budget" principle the patch budget
+        already follows.
+        """
+        self.writes_used = max(0, self.writes_used - 1)
 
     def consume_forge_execution(self) -> Optional[str]:
         """Consume one global Forge execution, including mutation runs."""
@@ -1395,10 +1514,17 @@ class FoundryConfigAudit:
                 )
                 continue
 
+            # PATCH (v5): fail closed on anything that is not a
+            # read-only grant. Previously only "read-write" was
+            # rejected and every other value (including Foundry's
+            # "write", or a typo) was allowed with a warning, so a
+            # write-permission entry passed the audit.
             if access != "read":
-                warnings_list.append(
-                    f"Unrecognized fs_permissions access "
-                    f"{access!r} at {full_key}"
+                found_keys.append(full_key)
+                errors.append(
+                    f"fs_permissions access {access!r} refused at "
+                    f"{full_key}: only read-only permissions "
+                    f"inside the project are allowed"
                 )
                 continue
 
@@ -1891,7 +2017,24 @@ class BountyEligibilityGate:
             result.setdefault("allowed_severities", [])
             return result
 
-        # REGEX NARRATIVE PATH (unchanged semantics, hardened roles)
+        # REGEX NARRATIVE PATH (fail-closed)
+        #
+        # PATCH (v5): this path used to decide eligibility from the
+        # LLM's prose alone. `poc_validated` was "does the text
+        # contain [PASS]", the attacker type came from the sentence
+        # "attacker_type: unprivileged", and verdicts / authz_map /
+        # role_grants / patch_map were ignored entirely. A report
+        # whose ```json:bounty-gating``` block was missing or
+        # malformed therefore became REPORTABLE with no judge
+        # verdict, no confirmed patch flip, and even with a
+        # SOURCE-level authz boundary on the target function — the
+        # exact opposite of the documented contract ("deterministic
+        # evidence only", "the LLM cannot override a SOURCE-level
+        # authz boundary").
+        #
+        # The prose signals are still computed and returned for the
+        # reviewer, but reportability now additionally requires the
+        # same deterministic evidence the structured path demands.
         text = str(narrative or "")
         reasons = []
 
@@ -1979,10 +2122,33 @@ class BountyEligibilityGate:
         if attacker_type == "UNVERIFIED":
             reasons.append("ATTACKER_TYPE_UNVERIFIED")
 
+        # PATCH (v5): deterministic evidence is mandatory here too.
+        # A hypothesis counts only when the judge validated it, no
+        # source-level authz boundary was found on the target, the
+        # PoC does not grant itself a role, and the patch flip was
+        # confirmed. With no such hypothesis — including the case
+        # where the gating block never made it into the report —
+        # the decision is NON_REPORTABLE.
+        deterministic_ids = sorted(
+            hid
+            for hid, vid in (verdicts or {}).items()
+            if vid == "BUG_VALIDATED"
+            and not (authz_map.get(hid) or {}).get(
+                "has_authz_boundary"
+            )
+            and not (role_grants or {}).get(hid)
+            and str((patch_map or {}).get(hid) or "")
+            == "PATCH_CONFIRMED"
+        )
+        if not deterministic_ids:
+            reasons.append("NO_STRUCTURED_GATING_BLOCK")
+
         eligible = not reasons
 
         return {
-            "gate_version": "4",
+            "gate_version": "5",
+            "source": "narrative_regex+deterministic",
+            "deterministic_ids": deterministic_ids,
             "decision":
                 "REPORTABLE" if eligible else "NON_REPORTABLE",
             "eligible": eligible,
@@ -2015,37 +2181,46 @@ def parse_judge_verdicts(narrative: str) -> Dict[str, str]:
 
     Accepts either a list of objects or a flat mapping. IDs are
     normalized through validate_hypothesis_id so H2-01, HP-5, etc.
-    all land on the same HYP-NNN key space used by test bindings."""
+    all land on the same HYP-NNN key space used by test bindings.
+
+    PATCH (v5): ALL blocks are parsed and later blocks override
+    earlier ones. The augmented narrative puts the report first and
+    the agent logs after it, so taking the first match let the
+    reporter's own echo of the verdicts (which the pipeline asks it
+    to include) win over the judge's real block — a reporter, or a
+    prompt injection inside the audited repo, could fabricate
+    BUG_VALIDATED. The judge's log is appended last, so it is the
+    authoritative source; a block that cannot be parsed is skipped
+    rather than aborting the whole parse.
+    """
     if not narrative:
         return {}
-    m = _JUDGE_VERDICT_RE.search(narrative)
-    if not m:
-        return {}
-    try:
-        data = json.loads(m.group(1).strip())
-    except (json.JSONDecodeError, TypeError):
-        return {}
     verdicts: Dict[str, str] = {}
-    items: List[Any] = []
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        items = [
-            {"hypothesis_id": k, "verdict": v}
-            for k, v in data.items()
-        ]
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        hid_raw = item.get("hypothesis_id")
-        verdict = str(item.get("verdict", "")).upper()
-        if not hid_raw or not verdict:
-            continue
+    for m in _JUDGE_VERDICT_RE.finditer(narrative):
         try:
-            hid = validate_hypothesis_id(str(hid_raw))
-        except ValueError:
+            data = json.loads(m.group(1).strip())
+        except (json.JSONDecodeError, TypeError):
             continue
-        verdicts[hid] = verdict
+        items: List[Any] = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = [
+                {"hypothesis_id": k, "verdict": v}
+                for k, v in data.items()
+            ]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            hid_raw = item.get("hypothesis_id")
+            verdict = str(item.get("verdict", "")).upper()
+            if not hid_raw or not verdict:
+                continue
+            try:
+                hid = validate_hypothesis_id(str(hid_raw))
+            except ValueError:
+                continue
+            verdicts[hid] = verdict
     return verdicts
 
 
@@ -2059,9 +2234,22 @@ def reconcile_findings(services, narrative: str) -> Dict[str, Any]:
     structured = BountyEligibilityGate._extract_structured_gating(
         narrative
     )
-    findings = (
-        (structured or {}).get("findings", []) if structured else []
-    )
+    if structured is None:
+        # PATCH (v5): an absent/unparseable gating block used to
+        # leave `findings` empty, so nothing was checked and the
+        # function returned clean=True. The caller only downgrades
+        # on a failed reconciliation, so a report that simply
+        # omitted the block passed every evidence check. Fail
+        # closed instead.
+        return {
+            "reportable_checked": 0,
+            "issues": [{
+                "hypothesis_id": "unknown",
+                "issue": "NO_STRUCTURED_GATING_BLOCK",
+            }],
+            "clean": False,
+        }
+    findings = structured.get("findings", [])
     checked = 0
     for f in findings:
         if not isinstance(f, dict) or f.get("reportable") is not True:
@@ -2263,6 +2451,31 @@ class BountyScopeEnforcer:
             if jaccard >= 0.65:
                 return known
         return None
+
+    def focus_contracts(self, names: Any) -> None:
+        """Restrict testing to the auditor's focus list.
+
+        PATCH (v5): focus is an ADDITIONAL restriction, never a way
+        to widen the bounty scope. The old code unioned the focus
+        list into `scope_contracts`, so
+        `--focus-contracts=OutOfScopeTarget` turned a contract that
+        the bounty spec excludes into a testable one — the opposite
+        of both the flag's purpose and the bounty rules. With a spec
+        whitelist present the focus set is INTERSECTED; without one
+        it becomes the whitelist.
+        """
+        focus: set = set()
+        for item in _as_str_list(names):
+            for part in str(item).split(","):
+                part = part.strip()
+                if part:
+                    focus.add(part)
+        if not focus:
+            return
+        if self.scope_contracts:
+            self.scope_contracts &= focus
+        else:
+            self.scope_contracts = set(focus)
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -2517,10 +2730,50 @@ class WorkspaceIntegrity:
                 try:
                     result[str(rel)] = sha256_file(path)
                 except OSError:
+                    # PATCH (v5): a file that cannot be hashed is not
+                    # evidence of a clean workspace.
+                    result["__skipped__"] = "1"
                     continue
                 count += 1
 
+        # PATCH (v5): symlinked tracked files are never yielded by
+        # `_iter_files_pruned`, so they were absent from the snapshot
+        # with no marker at all — the tamper check could not see a
+        # change to them while `snapshot_complete` still reported
+        # true. Flag the snapshot as incomplete instead.
+        if cls._has_symlinked_entries(root):
+            result["__skipped__"] = "1"
+
         return result
+
+    @classmethod
+    def _has_symlinked_entries(
+        cls, root: Path, limit: int = 20_000,
+    ) -> bool:
+        """True when a tracked directory holds a symlink entry."""
+        visited = 0
+        for name in cls.TRACKED_DIRS:
+            base = root / name
+            if not base.is_dir():
+                continue
+            stack = [base]
+            while stack:
+                current = stack.pop()
+                try:
+                    with os.scandir(current) as it:
+                        for entry in it:
+                            visited += 1
+                            if visited > limit:
+                                return True
+                            if entry.name in cls.EXCLUDED_DIR_NAMES:
+                                continue
+                            if entry.is_symlink():
+                                return True
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                except OSError:
+                    return True
+        return False
 
 
 # ============================================================
@@ -2532,15 +2785,38 @@ class EvidenceStore:
     def __init__(self, root: Path, enabled: bool = True):
         self.root = root.resolve()
         self.enabled = enabled
+        # PATCH (v5): every failed artifact write is recorded (and
+        # warned about) instead of vanishing. Callers keep working,
+        # but the audit trail is no longer silently incomplete.
+        self.failures: List[Dict[str, str]] = []
         if self.enabled:
-            self.root.mkdir(parents=True, exist_ok=True)
+            # PATCH (v5): do not resolve (resolving hid a symlinked
+            # `.security_pipeline`, which sent every artifact outside
+            # authorized_root) and do not mkdir through a symlink.
+            try:
+                if self.root.is_symlink():
+                    raise ValueError(
+                        f"Evidence root is a symlink: {self.root}"
+                    )
+                self.root.mkdir(parents=True, exist_ok=True)
+            except (ValueError, OSError) as exc:
+                self._record_failure(self.root, exc)
 
     def hypothesis_dir(self, hypothesis_id: str) -> Path:
         directory = (
             self.root / "artifacts" / safe_artifact_name(hypothesis_id)
         )
         if self.enabled:
-            directory.mkdir(parents=True, exist_ok=True)
+            try:
+                # PATCH (v5): validate BEFORE creating anything —
+                # mkdir() follows symlinks, so a symlinked
+                # `artifacts/` used to create directories outside
+                # authorized_root before the write was rejected.
+                reject_symlink_components(directory, self.root)
+                directory.mkdir(parents=True, exist_ok=True)
+                reject_symlink_components(directory, self.root)
+            except (ValueError, OSError) as exc:
+                self._record_failure(directory, exc)
         return directory
 
     def _safe_write(
@@ -2558,8 +2834,8 @@ class EvidenceStore:
             reject_symlink_components(path, self.root)
             path.parent.mkdir(parents=True, exist_ok=True)
             reject_symlink_components(path, self.root)
-        except (ValueError, OSError):
-            return None
+        except (ValueError, OSError) as exc:
+            return self._record_failure(path, exc)
         try:
             path.write_text(
                 json.dumps(
@@ -2568,9 +2844,29 @@ class EvidenceStore:
                 ),
                 encoding="utf-8",
             )
-        except OSError:
-            return None
+        except OSError as exc:
+            return self._record_failure(path, exc)
         return str(path)
+
+    def _record_failure(self, path: Path, exc: BaseException):
+        """Remember (and warn about) a failed evidence write.
+
+        PATCH (v5): the previous implementation returned None with no
+        trace, so a read-only or full evidence directory produced a
+        run whose artifacts were missing while every tool call still
+        reported success.
+        """
+        entry = {
+            "path": str(path),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        if entry not in self.failures:
+            self.failures.append(entry)
+        warnings.warn(
+            f"Evidence artifact not written: {path} ({exc})",
+            stacklevel=3,
+        )
+        return None
 
     def write_json(
         self,
@@ -2645,21 +2941,32 @@ class PseudoTestValidator:
         problems: List[str] = []
         warnings_list: List[str] = []
 
+        # PATCH (v5): every check except the import runs on a
+        # comment-stripped copy. Running the regexes on the raw
+        # source let a single comment ("// real target: new
+        # Vault();") satisfy the deployment check while the test
+        # still did pure math — the anti-pseudo control was
+        # bypassed by prose. String literals are kept so the
+        # `forge-std/Test.sol` import below is still visible.
+        scanned = _mask_comments_and_strings(
+            content, mask_strings=False,
+        )
+
         # 1. Must import forge-std/Test.sol
-        if not cls.FORGE_STD_IMPORT_RE.search(content):
+        if not cls.FORGE_STD_IMPORT_RE.search(scanned):
             problems.append(
                 'Missing `import {Test} from "forge-std/Test.sol";`'
             )
 
         # 2. Must inherit Test
-        if not cls.INHERIT_TEST_RE.search(content):
+        if not cls.INHERIT_TEST_RE.search(scanned):
             problems.append(
                 'Contract must inherit from `Test` '
                 '(e.g. `contract X is Test {`)'
             )
 
         # 3. Must deploy at least one contract
-        deploys = cls.DEPLOY_RE.findall(content)
+        deploys = cls.DEPLOY_RE.findall(scanned)
         if not deploys:
             problems.append(
                 "No contract deployment found. PoC must deploy the "
@@ -2669,20 +2976,20 @@ class PseudoTestValidator:
 
         # 4. PATCH (v2): must contain a real assertion. Cheatcodes
         # no longer satisfy this check.
-        if not cls.REAL_ASSERT_RE.search(content):
+        if not cls.REAL_ASSERT_RE.search(scanned):
             problems.append(
                 "No real assertion found. Use assertEq/assertTrue/"
                 "vm.expectRevert — vm.prank/vm.deal/vm.warp are "
                 "setup cheatcodes, not assertions."
             )
-        elif not cls.CHEATCODE_RE.search(content):
+        elif not cls.CHEATCODE_RE.search(scanned):
             warnings_list.append(
                 "No cheatcode found; verify the test actually "
                 "changes state as an attacker would."
             )
 
         # 5. Warn if it looks like pure math simulation
-        math_hits = len(cls.PURE_MATH_RE.findall(content))
+        math_hits = len(cls.PURE_MATH_RE.findall(scanned))
         if math_hits >= 3 and not deploys:
             problems.append(
                 "Test looks like a pure-math simulation "
@@ -3198,7 +3505,7 @@ def _tree_sha256(snapshot: Dict[str, str]) -> str:
     commit says (a dirty working tree still gets a stable id)."""
     digest = hashlib.sha256()
     for path in sorted(snapshot):
-        if path == "__truncated__":
+        if path in ("__truncated__", "__skipped__"):
             continue
         digest.update(path.encode("utf-8"))
         digest.update(b"\0")
@@ -3235,9 +3542,16 @@ class ReproducibilityLock:
             _tree_sha256(snap) if snap else None
         )
         result["audited_tree_files"] = sum(
-            1 for k in snap if k != "__truncated__"
+            1
+            for k in snap
+            if k not in ("__truncated__", "__skipped__")
         )
         result["audited_tree_truncated"] = "__truncated__" in snap
+        # PATCH (v5): a snapshot that had to skip entries is not a
+        # complete picture of the audited tree.
+        result["audited_tree_incomplete"] = (
+            "__skipped__" in snap
+        )
 
         if not forge_executable:
             result["forge_version"] = (
@@ -3328,15 +3642,18 @@ class TestFileWriter:
             # authorized_root. With --project-dir != --authorized-root
             # the old `root / clean` + `relative_to(project)` pairing
             # made every write fail with PATH_ERROR.
-            target = resolve_inside_root(
-                self.project / clean, self.project
-            )
-            reject_symlink_components(target, self.project)
+            # PATCH (v5): validate the UNRESOLVED path. Resolving
+            # first hid an in-root symlink such as
+            # `test/security_pipeline -> ../src`, so the write
+            # landed in src/ and still reported WRITE_SUCCESS.
+            requested = self.project / clean
+            reject_symlink_components(requested, self.project)
+            target = resolve_inside_root(requested, self.project)
             # Belt and braces: the resolved file must still live in
-            # the sandbox dir even if the redirect logic changes.
+            # the sandbox dir. Compared LEXICALLY (no .resolve()) so
+            # a symlinked sandbox directory cannot satisfy it.
             target.relative_to(
-                (self.project / "test" / "security_pipeline")
-                .resolve()
+                self.project / "test" / "security_pipeline"
             )
         except ValueError as exc:
             return {
@@ -3823,24 +4140,36 @@ class MutationTester:
         (assertEq(foo(a, b), c) -> assertEq(foo(a, foo(a), c);)
         produced unbalanced source that always failed to compile)
         and on assertions carrying a trailing message argument.
+
+        PATCH (v5): the call is located in a comment/string-free
+        copy of the source (the mask is length-preserving, so every
+        offset stays valid for the original text), and `'` is no
+        longer treated as a string delimiter — Solidity has no
+        single-quoted strings. Scanning the raw text matched the
+        first textual `assertEq(` even when it sat inside a comment
+        or a data string, so the mutation rewrote the wrong span:
+        a comment mention made a meaningless mutation look
+        applicable (false SURVIVED) and a string mention made a
+        correct test fail (false STRONG kill).
         """
-        m = re.search(rf"\b{re.escape(name)}\s*\(", source)
+        masked = _mask_comments_and_strings(source)
+        m = re.search(rf"\b{re.escape(name)}\s*\(", masked)
         if not m:
             return None
-        open_idx = source.find("(", m.start())
+        open_idx = masked.find("(", m.start())
         depth = 0
         in_str = None
         i = open_idx
         close_idx = -1
-        while i < len(source):
-            ch = source[i]
+        while i < len(masked):
+            ch = masked[i]
             if in_str:
                 if ch == "\\":
                     i += 2
                     continue
                 if ch == in_str:
                     in_str = None
-            elif ch in ('"', "'"):
+            elif ch == '"':
                 in_str = ch
             elif ch in "([{":
                 depth += 1
@@ -3855,7 +4184,7 @@ class MutationTester:
         if close_idx == -1:
             return None
 
-        body = source[open_idx + 1:close_idx]
+        body = masked[open_idx + 1:close_idx]
         base = open_idx + 1
         args: List[str] = []
         spans: List[tuple] = []
@@ -3871,18 +4200,20 @@ class MutationTester:
                     continue
                 if ch == in_str:
                     in_str = None
-            elif ch in ('"', "'"):
+            elif ch == '"':
                 in_str = ch
             elif ch in "([{":
                 depth += 1
             elif ch in ")]}":
                 depth -= 1
             elif ch == "," and depth == 0:
-                args.append(body[cur_start:i])
+                # Argument text is taken from the ORIGINAL source so
+                # string literals inside an argument survive.
+                args.append(source[base + cur_start:base + i])
                 spans.append((base + cur_start, base + i))
                 cur_start = i + 1
             i += 1
-        args.append(body[cur_start:])
+        args.append(source[base + cur_start:base + len(body)])
         spans.append((base + cur_start, base + len(body)))
         return args, spans
 
@@ -4118,17 +4449,39 @@ def _parse_unified_diff(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Parse a multi-file unified diff into
     {relative_path: [hunk, ...]} where a hunk holds the old/new
-    line lists. Only `+`/`-`/context lines are honoured; headers,
-    `\\ No newline` markers and git index lines are ignored."""
+    line lists.
+
+    PATCH (v5): the declared line counts decide when a hunk is
+    finished, so a hunk body line that happens to start with
+    `+++ ` (an added `++ flag`) or `--- ` (a removed `-- flag`) is
+    read as content instead of being mistaken for a file header and
+    silently dropped. The `\ No newline at end of file` marker is
+    recorded per side instead of being discarded, so a patch that
+    changes the trailing-newline state applies to the right text.
+    """
     if not isinstance(diff_text, str) or not diff_text.strip():
         raise PatchApplyError("Empty patch.")
 
     files: Dict[str, List[Dict[str, Any]]] = {}
     current: Optional[str] = None
     hunk: Optional[Dict[str, Any]] = None
+    old_seen = 0
+    new_seen = 0
+    last_kind: Optional[str] = None
+
+    def hunk_open() -> bool:
+        """True while the current hunk still expects body lines."""
+        if hunk is None:
+            return False
+        return (
+            old_seen < hunk.get("old_count", 0)
+            or new_seen < hunk.get("new_count", 0)
+        )
 
     for raw in diff_text.splitlines():
-        if raw.startswith("+++ "):
+        inside = hunk_open()
+
+        if raw.startswith("+++ ") and not inside:
             path = raw[4:].strip()
             if path.startswith("b/"):
                 path = path[2:]
@@ -4143,8 +4496,11 @@ def _parse_unified_diff(
                 )
             files[current] = []
             hunk = None
+            last_kind = None
             continue
-        if raw.startswith("--- ") or raw.startswith("diff "):
+        if raw.startswith("--- ") and not inside:
+            continue
+        if raw.startswith("diff ") and not inside:
             continue
         if raw.startswith("@@"):
             if current is None:
@@ -4152,7 +4508,8 @@ def _parse_unified_diff(
                     "Hunk before any +++ file header."
                 )
             m = re.match(
-                r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s*@@",
+                r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)"
+                r"(?:,(\d+))?\s*@@",
                 raw,
             )
             if not m:
@@ -4163,20 +4520,43 @@ def _parse_unified_diff(
                 "old": [],
                 "new": [],
                 "header": raw,
+                # PATCH (v5): the declared 1-based start line is the
+                # anchor the hunk is applied against, and the
+                # declared counts bound the hunk body.
+                "old_start": int(m.group(1)),
+                "old_count": int(m.group(2) or 1),
+                "new_count": int(m.group(4) or 1),
             }
+            old_seen = 0
+            new_seen = 0
+            last_kind = None
             files[current].append(hunk)
             continue
         if raw.startswith("\\ No newline"):
+            # PATCH (v5): the marker belongs to the line just above
+            # it, so record which side has no trailing newline.
+            if hunk is not None:
+                if last_kind in ("old", "both"):
+                    hunk["old_no_newline"] = True
+                if last_kind in ("new", "both"):
+                    hunk["new_no_newline"] = True
             continue
         if hunk is None:
             continue
         if raw.startswith("+"):
             hunk["new"].append(raw[1:])
+            new_seen += 1
+            last_kind = "new"
         elif raw.startswith("-"):
             hunk["old"].append(raw[1:])
+            old_seen += 1
+            last_kind = "old"
         elif raw.startswith(" ") or raw == "":
             hunk["old"].append(raw[1:] if raw else "")
             hunk["new"].append(raw[1:] if raw else "")
+            old_seen += 1
+            new_seen += 1
+            last_kind = "both"
         else:
             raise PatchApplyError(
                 f"Unexpected diff line: {raw[:60]!r}"
@@ -4197,9 +4577,19 @@ def _apply_hunks(
 ) -> str:
     """Apply parsed hunks to one file's text.
 
-    Context lines must match EXACTLY, but the stated start offset is
-    only a hint: the search slides up to PATCH_DIFF_FUZZ_LINES lines
-    in either direction because LLM-produced line numbers drift.
+    Context lines must match EXACTLY. The hunk's declared start
+    offset is the search anchor (LLM-produced line numbers drift, so
+    the search slides up to PATCH_DIFF_FUZZ_LINES lines around it),
+    with an additional forward scan from the cursor for badly
+    drifted offsets.
+
+    PATCH (v5): hunks are applied in strictly increasing order.
+    The previous implementation anchored the search window on the
+    cursor only and accepted matches BEFORE it, which
+    (a) rejected every valid multi-hunk patch whose hunks were more
+    than PATCH_DIFF_FUZZ_LINES lines apart, and
+    (b) silently duplicated the tail of the file when a later hunk
+    matched earlier in the source. Both are now explicit errors.
     """
     lines = source.split("\n")
     cursor = 0
@@ -4212,15 +4602,35 @@ def _apply_hunks(
             raise PatchApplyError(
                 f"Hunk without context/removal lines in {label}."
             )
-        # find the old sequence near the cursor (the stated offset is
-        # a hint; LLM line numbers drift, content must match exactly)
-        window = [cursor]
+        declared = hunk.get("old_start")
+        if isinstance(declared, int) and declared > 0:
+            anchor = declared - 1  # unified-diff lines are 1-based
+            if anchor < cursor:
+                # PATCH (v5): a hunk that points BEFORE the end of the
+                # previous hunk is malformed (unified-diff hunks are
+                # ordered). Clamping it to the cursor used to let the
+                # search land on a LATER duplicate of the same block
+                # and silently patch the wrong line, so this is an
+                # explicit error: the diff must be re-generated with
+                # hunk headers in increasing file order.
+                raise PatchApplyError(
+                    f"Hunk is out of order in {label}: it declares "
+                    f"line {declared}, but the previous hunk already "
+                    f"consumed through line {cursor}. Hunks must be "
+                    f"ordered by file position. "
+                    f"{hunk['header'][:60]!r}"
+                )
+        else:
+            anchor = cursor
+
+        window: List[int] = [anchor]
         for delta in range(1, PATCH_DIFF_FUZZ_LINES + 1):
-            window.append(cursor - delta)
-            window.append(cursor + delta)
+            window.append(anchor + delta)
+            window.append(anchor - delta)
+
         found = None
         for pos in window:
-            if pos < 0 or pos + len(old) > len(lines):
+            if pos < cursor or pos + len(old) > len(lines):
                 continue
             if lines[pos:pos + len(old)] == old:
                 found = pos
@@ -4262,6 +4672,21 @@ def apply_unified_diff(
     path = only_path if only_path is not None else next(iter(files))
     hunks = files[path]
     patched = _apply_hunks(source, hunks, path)
+
+    # PATCH (v5): honour `\ No newline at end of file`. Discarding the
+    # marker applied the patch with the wrong trailing newline, and a
+    # diff whose only effect was the trailing newline collapsed into
+    # the spurious "zero changes (no-op)" error below.
+    last = hunks[-1]
+    if last.get("new_no_newline") and patched.endswith("\n"):
+        patched = patched[:-1]
+    elif (
+        last.get("old_no_newline")
+        and not source.endswith("\n")
+        and not patched.endswith("\n")
+    ):
+        patched += "\n"
+
     if patched == source:
         raise PatchApplyError(
             "Patch applied to zero changes (no-op)."
@@ -4548,23 +4973,37 @@ class PatchDifferentialTester:
 class ExploitPoCValidator:
     """Validasi test mode EXPLOIT_MUST_SUCCEED."""
 
+    # PATCH (v5): identifier fragments must sit on a real word
+    # boundary (start of the name, after an underscore, or a
+    # camelCase capital) and the profit check must be a POSITIVE
+    # comparison. The old patterns matched any identifier merely
+    # CONTAINING a fragment — `spread` counted as a `pre` snapshot,
+    # `spending` counted as an `end` snapshot, and
+    # `assertTrue(noProfitPossible)` counted as a profit assertion —
+    # so a PoC that quantified no extraction passed the validator
+    # that exists to enforce exactly that.
     PROFIT_ASSERT_RE = re.compile(
-        r'assert(?:Gt|Ge|True|NotEq)\s*\(\s*'
-        r'(?:\w*(?:profit|gain|stolen|drained|delta|'
-        r'extracted|attackerAfter|attackerBalAfter)\w*)',
+        r'assert(?:Gt|Ge)\s*\(\s*[^;]{0,200}?'
+        r'(?:\w*(?:profit|gain|stolen|drained|delta|extracted)\w*'
+        r'|\w*(?:attackerAfter|attackerBalAfter|balAfter|afterBal|'
+        r'postBal|balanceAfter|endBalance)\w*)',
         re.IGNORECASE,
     )
     BEFORE_RE = re.compile(
-        r'(?:uint\d*|int\d*)\s+\w*'
-        r'(?:before|initial|pre|start|balBefore|balPre)\w*'
-        r'\s*=\s*[^;]*'
+        r'(?:uint\d*|int\d*)\s+'
+        + _snapshot_name_pattern(
+            ("before", "pre", "initial", "start")
+        )
+        + r'\s*=\s*[^;]*'
         r'(?:balanceOf|totalAssets|totalSupply|getReserves)',
         re.IGNORECASE,
     )
     AFTER_RE = re.compile(
-        r'(?:uint\d*|int\d*)\s+\w*'
-        r'(?:after|final|post|end|balAfter|balPost)\w*'
-        r'\s*=\s*[^;]*'
+        r'(?:uint\d*|int\d*)\s+'
+        + _snapshot_name_pattern(
+            ("after", "post", "end", "final")
+        )
+        + r'\s*=\s*[^;]*'
         r'(?:balanceOf|totalAssets|totalSupply|getReserves)',
         re.IGNORECASE,
     )
@@ -4698,11 +5137,12 @@ class SecurityAnalysisServices:
 
         # PATCH (v2): focus_contracts enforced as an additional
         # whitelist in write_test, not just prompt text.
+        # PATCH (v5): applied as an INTERSECTION so focusing can
+        # never pull an out-of-scope contract into the bounty scope.
         if getattr(config, "focus_contracts", None):
-            for name in str(config.focus_contracts).split(","):
-                name = name.strip()
-                if name:
-                    self.scope_enforcer.scope_contracts.add(name)
+            self.scope_enforcer.focus_contracts(
+                config.focus_contracts
+            )
 
         # PATCH (v2): --known-issues-file was a dead flag; wire it.
         ki_path = getattr(config, "known_issues_file", None)
@@ -4941,6 +5381,29 @@ class SecurityAnalysisServices:
                 ),
             })
 
+        # PATCH (v5): property_text used to be optional, so omitting it
+        # silently skipped the known-issue filter (is_known_issue("") is
+        # None) and downgraded the duplicate fingerprint to the
+        # file/test-name branch. When the bounty spec declares known
+        # issues, the property is mandatory.
+        if (
+            self.scope_enforcer.known_issues
+            and not str(property_text or "").strip()
+        ):
+            return self._json({
+                "success": False,
+                "result_type": "PROPERTY_TEXT_REQUIRED",
+                "error": (
+                    "property_text is required: the bounty spec "
+                    "declares known issues, so the property has to be "
+                    "stated for the known-issue filter (and the "
+                    "duplicate fingerprint) to work."
+                ),
+                "known_issues_count": len(
+                    self.scope_enforcer.known_issues
+                ),
+            })
+
         known = self.scope_enforcer.is_known_issue(property_text)
         if known:
             return self._json({
@@ -5073,6 +5536,10 @@ class SecurityAnalysisServices:
                 })
 
             result = self.writer.write(relative_path, content)
+            if not result.get("success"):
+                # PATCH (v5): the write was refused (path guard,
+                # overwrite refusal, I/O error) — do not charge it.
+                self.budget.refund_write()
             result["hypothesis_id"] = hypothesis_id
             result["test_mode"] = test_mode
             result["test_name"] = test_name
@@ -5219,9 +5686,10 @@ class SecurityAnalysisServices:
         )
         after = WorkspaceIntegrity.snapshot(self.project)
         tampered = before != after
-        snapshot_unverified = (
-            "__truncated__" in before
-            or "__truncated__" in after
+        snapshot_unverified = any(
+            marker in snapshot
+            for snapshot in (before, after)
+            for marker in ("__truncated__", "__skipped__")
         )
 
         result["hypothesis_id"] = hypothesis_id
@@ -6012,8 +6480,12 @@ def audit_pseudo_in_report(report_text: str) -> List[Dict[str, Any]]:
     validated PoCs.
     """
     warnings_out: List[Dict[str, Any]] = []
+    # PATCH (v5): accept any language tag (```Sol, ```solidity,
+    # bare) and CRLF fences. The previous pattern required a literal
+    # "solidity" followed by "\n", so a pseudo-test presented under
+    # another fence spelling was never audited.
     code_blocks = re.findall(
-        r"```(?:solidity)?\n(.*?)```", report_text, re.DOTALL,
+        r"```[^\n]*\r?\n(.*?)```", report_text, re.DOTALL,
     )
 
     for i, block in enumerate(code_blocks):
@@ -6191,6 +6663,21 @@ class StaticAnalysisPrepass:
             data = json.loads(out)
         except json.JSONDecodeError:
             return [], "slither output was not valid JSON"
+        # PATCH (v5): slither reports a failed analysis as
+        # {"success": false, "error": ..., "results": null}. The old
+        # parser turned that into an empty detector list, so a
+        # compilation failure was indistinguishable from a clean run
+        # ("ran, found nothing"). Surface it as an error instead.
+        if data.get("success") is False:
+            return [], (
+                "slither reported failure: "
+                + str(data.get("error") or "unknown error")
+            )
+        if "results" in data and data.get("results") is None:
+            return [], (
+                "slither returned no results (analysis did not "
+                "complete)"
+            )
         results: List[Dict[str, Any]] = []
         for r in (data.get("results", {}) or {}).get(
             "detectors", []
@@ -8391,12 +8878,16 @@ Rules:
                 Path(self.config.project_dir)
                 / ".security_pipeline" / "logs" / "agents"
             )
+            # PATCH (v5): the judge's log is appended LAST because
+            # parse_judge_verdicts lets the last block win — the
+            # judge is the authority on its own verdicts, not the
+            # reporter that echoes them.
             log_files = [
                 "11_reporter.log",
-                "08_judge.log",
                 "06_debator.log",
                 "07_skeptic.log",
                 "05_critic.log",
+                "08_judge.log",
             ]
             extra_parts = []
             for fname in log_files:
