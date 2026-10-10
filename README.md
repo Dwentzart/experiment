@@ -244,7 +244,7 @@ Seluruh pipeline berada di satu file, `pipeline_final.py` (±8.700 baris). Tidak
 - Seksi ditandai banner komentar berurutan: `CONFIG` → `ENVIRONMENT` → `PATH / TEXT HELPERS` → `AUTHZ BOUNDARY DETECTOR` → `ROLE-GRANT-TO-ATTACKER DETECTOR` → `MODERN SURFACE SCANNER` → `BUDGET` → `FOUNDRY CONFIG AUDIT` → `FORGE-STD LOCATOR` → `BOUNTY ELIGIBILITY GATE` → `JUDGE VERDICT PARSER` → `BOUNTY SCOPE ENFORCER` → `TEST SPECIFICATION` → `FINDING CONFIDENCE` → `INTEGRITY` → `EVIDENCE STORE` → `ANTI-PSEUDO TEST VALIDATOR` → `SCOPE / DUPLICATE` → `SOURCE SLICER` → `REPRODUCIBILITY LOCK` → `TEST FILE WRITER` → `FORGE RUNNER` → `MUTATION TESTER` → `PATCH-DIFFERENTIAL VALIDATOR` → `EXPLOIT POC VALIDATOR` → `SERVICES` → `TOOL SCHEMAS` → `AGENT LIMITS` → `PSEUDO DETECTION` → `STATIC ANALYSIS PREPASS` → `AGENT LOG MANAGER` → `CREW` → `MAIN`.
 - Entry point: `if __name__ == "__main__"` memakai `argparse`, membangun `PipelineConfig`, lalu `SoliditySecurityCrew(config).preflight()` → `.run()`.
 
-Catatan: docstring di kepala file masih menulis `pipeline_final.py (v2)` dan menandai patch sebagai `(v2)` / `(v3)`, sementara beberapa banner seksi (mis. gate) menulis `v4`. Penanda ini hanya label historis patch, bukan nomor rilis.
+Catatan: komentar patch di dalam file memakai penanda `(v2)` / `(v3)` / `(v4)`. Penanda itu menunjukkan **kapan** sebuah kontrol ditambahkan, bukan nomor rilis — konvensi ini didokumentasikan di docstring kepala file.
 
 ---
 

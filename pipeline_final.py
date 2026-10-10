@@ -1,9 +1,17 @@
 """
-pipeline_final.py (v2)
+pipeline_final.py
 
 Authorized Solidity / Foundry security analysis pipeline.
 
-8 reasoning agents. Maturity is deterministic control, not extra LLMs:
+Patch markers in this docstring (v2 / v3 / v4) label WHEN a control was
+added, not a release number. Everything listed below exists in the
+current code.
+
+11 reasoning agents / 14 sequential tasks: the 8 original roles, plus a
+debate round (Vulnerability Debator -> Vulnerability Skeptic ->
+Hypothesis Judge), plus a follow-up round that reuses the deep-dive,
+invariant and validation agents. Maturity is deterministic control,
+not extra LLMs:
 
   1. Scope / duplicate registry (wired into write_test)
   2. Bounded list / read / search  (slice-lite)
@@ -11,6 +19,10 @@ Authorized Solidity / Foundry security analysis pipeline.
   4. Workspace integrity snapshots
   5. Bounded mutation checks on generated tests only
   6. Finding confidence as an evidence ladder (not a score)
+  7. Patch-differential confirmation on a sandbox copy (v3)
+  8. Deterministic bounty eligibility gate, fail-closed (v4)
+  9. Static prepass (slither / aderyn) + modern surface scanner (v2)
+ 10. Anti-pseudo test validation + structural PoC validation (v2)
 
 Hard controls:
   - no shell=True
@@ -78,6 +90,17 @@ v3 addenda (bounty-grade evidence):
     a stable id. Reports without the revision are unverifiable.
   - budget: max_patch_runs (--max-patch-runs). Refusals (bad
     diff, unsafe path, off-contract target) cost no budget.
+
+v4 addenda (fail-closed eligibility):
+  - BountyEligibilityGate consumes DETERMINISTIC EVIDENCE ONLY:
+    source-level authz scans, PoC role-grant scans, judge verdicts,
+    patch-differential verdicts, and artifact reconciliation.
+  - poc_validated / integrity_ok in the gating JSON are CLAIMS to be
+    checked, never evidence.
+  - Judge verdict is enforced: a missing verdict, or anything other
+    than BUG_VALIDATED, downgrades the finding.
+  - impact_type must be a direct fund-loss or permanent-lock category.
+  - Reconciliation failure forces NON_REPORTABLE.
 
 Portability:
   - Agent kwargs are filtered against the installed CrewAI Agent.
