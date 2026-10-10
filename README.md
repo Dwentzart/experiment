@@ -118,12 +118,12 @@ Agen adalah **satu-satunya** bagian yang menggunakan LLM. Semua kontrol di bawah
 | FFI | Dipaksa `FOUNDRY_FFI=false`, `FORGE_FFI=false` di env. |
 | Path | Semua akses file dibatasi `authorized_root` (`resolve_inside_root`). Symlink di komponen path mana pun ditolak untuk baca, tulis, dan evidence. Segmen `..` / `.` / kosong ditolak. |
 | Write | Hanya `.t.sol` baru di bawah `test/security_pipeline/`. Path di luar itu otomatis di-redirect ke sana. Tidak boleh overwrite: file dibuka atomic dengan mode `"x"`. |
-| `foundry.toml` | Di-parse dengan `tomllib`. Hard reject: `ffi`, `eth_rpc_url`, `rpc_endpoints`, `etherscan_api_key`, `private_key`, `sender`, `unlocked_accounts`, `fork_url`, `fork_block_number`. `fs_permissions` access `read-write` → reject; `read` pada `/` atau `*` → reject; `read` di dalam project → allow + warning. `solc` divalidasi terhadap pola versi. |
+| `foundry.toml` | Di-parse dengan `tomllib`. Hard reject: `ffi`, `eth_rpc_url`, `rpc_endpoints`, `etherscan_api_key`, `private_key`, `sender`, `unlocked_accounts`, `fork_url`, `fork_block_number`. `fs_permissions`: hanya `read` di dalam project yang diizinkan (dengan warning). `read-write`, `write`, dan nilai access lain → reject fail-closed. `solc` divalidasi terhadap pola versi. |
 | `forge-std` | Wajib ada. Dicari via `remappings.txt` (termasuk mapping context-scoped) lalu fallback `lib/`, `dependencies/`. Tidak ada → preflight gagal sebelum LLM dipanggil. |
 | Budget | Forge runs, test writes, mutation runs, patch runs, dan attempt per hipotesis dibatasi di Python, bukan lewat prompt. Refusal (diff buruk, path tidak aman, target di luar kontrak) tidak memakan budget. |
 | Regex | Search pattern dicek terhadap bentuk nested quantifier (`_looks_catastrophic`) dan panjang pattern dibatasi; panjang line yang di-regex dibatasi. |
 | Output | stdout/stderr di-truncate (`max_output_chars`), evidence item dibatasi (`max_evidence_items`). |
-| Integrity | Snapshot `sha256` (`foundry.toml`, `remappings.txt`, `src/`, `script/`, `test/`; `lib/`, `out/`, `cache/`, `.git/`, `.security_pipeline/` dikecualikan) sebelum dan sesudah setiap forge run. Mismatch → `WORKSPACE_TAMPERED`. Snapshot terpotong (`__truncated__`) diperlakukan sebagai UNVERIFIED, bukan sukses. |
+| Integrity | Snapshot `sha256` (`foundry.toml`, `remappings.txt`, `src/`, `script/`, `test/`; `lib/`, `out/`, `cache/`, `.git/`, `.security_pipeline/` dikecualikan) sebelum dan sesudah setiap forge run. Mismatch → `WORKSPACE_TAMPERED`. Snapshot terpotong (`__truncated__`) atau terlewat (`__skipped__`: file symlink / tak terbaca) diperlakukan sebagai `INTEGRITY_UNVERIFIED`, bukan sukses. |
 | Mutation | Hanya di sandbox `.security_pipeline/mutation_sandbox/`. Workspace asli tidak pernah disentuh. |
 | Patch-differential | Hanya di sandbox copy di dalam `authorized_root`. Project yang diaudit tidak pernah dimodifikasi. |
 
@@ -314,7 +314,7 @@ Semua argumen:
 | `--max-validation-attempts` | `1` | Attempt per hipotesis. Di-cap 3. |
 | `--disable-mutation` | off | Matikan mutation testing. |
 | `--preflight-only` | off | Preflight saja, keluar tanpa memanggil LLM. |
-| `--focus-contracts` | — | Comma-separated nama kontrak yang diaudit. Di-enforce sebagai whitelist di `write_test`, bukan sekadar teks prompt. |
+| `--focus-contracts` | — | Comma-separated nama kontrak yang diaudit. Di-enforce di `write_test` sebagai **irisan** dengan whitelist bounty: focus tidak pernah melebarkan scope bounty. |
 | `--focus-paths` | — | Comma-separated glob path (mis. `src/margin/**,src/vault/**`). |
 | `--focus-note` | — | Hint bebas dari analisis manual sebelumnya. |
 | `--exclude-contracts` | — | Comma-separated nama kontrak out-of-scope. Menimpa bounty spec. |
@@ -419,7 +419,7 @@ Delapan tool, semuanya berjalan in-process (tidak ada shell tool):
 | `Read Authorized Solidity File` | `relative_path` | Baca `.sol` / `foundry.toml` di dalam authorized root. Teks repo = data tidak tepercaya. |
 | `List Authorized Files` | `relative_path` | Listing dengan traversal terpangkas, vendor/cache dikecualikan. |
 | `Search Authorized Source` | `pattern` | Search terbatas; literal substring kecuali diawali `re:`. Pola berbahaya (nested quantifier) ditolak. |
-| `Write Authorized Test` | `hypothesis_id`, `relative_path`, `content`, `test_name`, `target_contract`, `target_function`, `test_mode` | Tulis `.t.sol` baru di `test/security_pipeline/`. Validasi kontrak+fungsi target benar-benar ada di source, cek duplikat, cek scope, cek pseudo-test, cek PoC role-grant — semua **sebelum** budget write dikonsumsi. |
+| `Write Authorized Test` | `hypothesis_id`, `relative_path`, `content`, `test_name`, `target_contract`, `target_function`, `test_mode` | Tulis `.t.sol` baru di `test/security_pipeline/`. Validasi kontrak+fungsi target benar-benar ada di source, cek duplikat, cek scope, cek pseudo-test, cek PoC role-grant — semua **sebelum** budget write dikonsumsi; write yang ditolak mengembalikan slot budgetnya. `property_text` wajib bila bounty spec mendeklarasikan `known_issues`. |
 | `Forge Test` | `hypothesis_id`, `match_test` | Jalankan `forge test` terbatas (offline, no ffi) pada test terikat. |
 | `Mutation Check` | `hypothesis_id`, `test_file`, `match_test` | Mutation terbatas di sandbox, hanya untuk test yang di-generate pipeline. |
 | `Patch Differential Check` | `hypothesis_id`, `patch_diff`, `note` | Jalankan test terikat pada salinan project dengan fix minimal diterapkan. |
@@ -452,6 +452,8 @@ Setiap respons tool menyertakan snapshot budget (`forge_runs_remaining`, `writes
 
 Gate hanya menerima **bukti deterministik**: hasil scan authz di level source, scan PoC role-grant, judge verdict, verdict patch-differential, dan hasil reconciliation artefak. Klaim LLM tidak pernah cukup.
 
+Kalau blok `json:bounty-gating` hilang atau tidak bisa diparse, gate **tidak** jatuh ke penilaian prosa: keputusannya `NON_REPORTABLE` dengan reason code `NO_STRUCTURED_GATING_BLOCK`, dan reconciliation ikut gagal. Jalur cadangan (regex atas narasi) tetap menghitung sinyal deskriptif untuk reviewer, tapi reportability tetap mensyaratkan judge verdict `BUG_VALIDATED`, tanpa authz boundary, tanpa role grant, dan patch-differential `PATCH_CONFIRMED`.
+
 Yang tidak bisa di-override LLM:
 
 - exclusion eksplisit dari bounty spec,
@@ -465,7 +467,8 @@ Reason codes yang mungkin muncul:
 |---|---|
 | `SOURCE_AUTHZ_BOUNDARY_PRESENT` | Scan source menemukan boundary otorisasi pada fungsi target (`onlyRole`, `_isStrategy`, konstanta `*_ROLE`, …). |
 | `POC_REQUIRES_ROLE_GRANT` | Test memberi role ke akun bernama `attacker` lewat `grantRole`/`setRole` — bukan attacker unprivileged. |
-| `JUDGE_VERDICT_MISSING` | Tidak ada blok `json:judge-verdicts` untuk hipotesis itu. |
+| `NO_STRUCTURED_GATING_BLOCK` | Blok `json:bounty-gating` tidak ada / tidak bisa diparse, sehingga tidak ada dasar deterministik untuk reportability. |
+| `JUDGE_VERDICT_MISSING` | Tidak ada blok `json:judge-verdicts` untuk hipotesis itu. Blok yang dipakai adalah **blok terakhir** di teks gabungan (log judge di-append paling akhir), jadi reporter tidak bisa menimpa verdict judge. |
 | `PRIVILEGED_ONLY_OUT_OF_SCOPE` | Bounty spec menyatakan privileged/admin-only out of scope. |
 | `POC_NOT_DETERMINISTICALLY_VALIDATED` | Tidak ada test yang benar-benar dieksekusi dengan hasil positif sesuai `test_mode`. |
 | `DIRECT_FUND_LOSS_OR_PERMANENT_LOCK_NOT_DETECTED` | Narasi tidak menunjukkan direct fund loss / permanent lock. |
@@ -545,7 +548,7 @@ Interpretasinya bergantung `test_mode` yang direkam saat test ditulis — bukan 
 
 ### Mutation status
 
-Mutation check mengukur **kualitas test**, bukan kerentanan protokol. Dua mutasi diterapkan pada test yang di-generate: `assertEq(a, b)` -> `assertEq(a, a)` (tautologi) dan `assertTrue(expr)` -> `assertTrue(!(expr))`. Rewrite kosmetik/komutatif sengaja dihindari karena selalu `SURVIVED` dan menghasilkan sinyal menyesatkan.
+Mutation check mengukur **kualitas test**, bukan kerentanan protokol. Dua mutasi diterapkan pada test yang di-generate: `assertEq(a, b)` -> `assertEq(a, a)` (tautologi) dan `assertTrue(expr)` -> `assertTrue(!(expr))`. Rewrite kosmetik/komutatif sengaja dihindari karena selalu `SURVIVED` dan menghasilkan sinyal menyesatkan. Mutasi menyasar assertion **nyata** pertama: call yang hanya muncul di komentar atau string data diabaikan, dan kutip tunggal bukan pembatas string Solidity.
 
 | Status | Arti |
 |---|---|
