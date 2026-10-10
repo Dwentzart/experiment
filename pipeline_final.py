@@ -865,6 +865,26 @@ def _mask_comments_and_strings(
     return "".join(out)
 
 
+def _snapshot_name_pattern(fragments) -> str:
+    """Regex for an identifier that contains one of `fragments` at a
+    REAL word boundary: at the start of the name, right after an
+    underscore, or capitalised inside a camelCase name.
+
+    PATCH (v5): used by ExploitPoCValidator. A plain
+    ``\w*(?:pre)\w*`` also matches `spread`, which made a variable
+    that is not a before/after snapshot satisfy the check.
+    """
+    lower = "|".join(re.escape(f) for f in fragments)
+    caps = "|".join(
+        re.escape(f[:1].upper() + f[1:]) for f in fragments
+    )
+    return (
+        r"(?:(?:[A-Za-z0-9_]*_)?(?:" + lower + r"|" + caps + r")"
+        r"[A-Za-z0-9_]*"
+        r"|[A-Za-z0-9]*[a-z0-9](?:" + caps + r")[A-Za-z0-9_]*)"
+    )
+
+
 def _function_decl_pattern(name: str) -> str:
     """Regex source matching the declaration head of a Solidity
     function, modifier, or constructor named `name`.
@@ -2710,10 +2730,50 @@ class WorkspaceIntegrity:
                 try:
                     result[str(rel)] = sha256_file(path)
                 except OSError:
+                    # PATCH (v5): a file that cannot be hashed is not
+                    # evidence of a clean workspace.
+                    result["__skipped__"] = "1"
                     continue
                 count += 1
 
+        # PATCH (v5): symlinked tracked files are never yielded by
+        # `_iter_files_pruned`, so they were absent from the snapshot
+        # with no marker at all — the tamper check could not see a
+        # change to them while `snapshot_complete` still reported
+        # true. Flag the snapshot as incomplete instead.
+        if cls._has_symlinked_entries(root):
+            result["__skipped__"] = "1"
+
         return result
+
+    @classmethod
+    def _has_symlinked_entries(
+        cls, root: Path, limit: int = 20_000,
+    ) -> bool:
+        """True when a tracked directory holds a symlink entry."""
+        visited = 0
+        for name in cls.TRACKED_DIRS:
+            base = root / name
+            if not base.is_dir():
+                continue
+            stack = [base]
+            while stack:
+                current = stack.pop()
+                try:
+                    with os.scandir(current) as it:
+                        for entry in it:
+                            visited += 1
+                            if visited > limit:
+                                return True
+                            if entry.name in cls.EXCLUDED_DIR_NAMES:
+                                continue
+                            if entry.is_symlink():
+                                return True
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                except OSError:
+                    return True
+        return False
 
 
 # ============================================================
@@ -2725,15 +2785,38 @@ class EvidenceStore:
     def __init__(self, root: Path, enabled: bool = True):
         self.root = root.resolve()
         self.enabled = enabled
+        # PATCH (v5): every failed artifact write is recorded (and
+        # warned about) instead of vanishing. Callers keep working,
+        # but the audit trail is no longer silently incomplete.
+        self.failures: List[Dict[str, str]] = []
         if self.enabled:
-            self.root.mkdir(parents=True, exist_ok=True)
+            # PATCH (v5): do not resolve (resolving hid a symlinked
+            # `.security_pipeline`, which sent every artifact outside
+            # authorized_root) and do not mkdir through a symlink.
+            try:
+                if self.root.is_symlink():
+                    raise ValueError(
+                        f"Evidence root is a symlink: {self.root}"
+                    )
+                self.root.mkdir(parents=True, exist_ok=True)
+            except (ValueError, OSError) as exc:
+                self._record_failure(self.root, exc)
 
     def hypothesis_dir(self, hypothesis_id: str) -> Path:
         directory = (
             self.root / "artifacts" / safe_artifact_name(hypothesis_id)
         )
         if self.enabled:
-            directory.mkdir(parents=True, exist_ok=True)
+            try:
+                # PATCH (v5): validate BEFORE creating anything —
+                # mkdir() follows symlinks, so a symlinked
+                # `artifacts/` used to create directories outside
+                # authorized_root before the write was rejected.
+                reject_symlink_components(directory, self.root)
+                directory.mkdir(parents=True, exist_ok=True)
+                reject_symlink_components(directory, self.root)
+            except (ValueError, OSError) as exc:
+                self._record_failure(directory, exc)
         return directory
 
     def _safe_write(
@@ -2751,8 +2834,8 @@ class EvidenceStore:
             reject_symlink_components(path, self.root)
             path.parent.mkdir(parents=True, exist_ok=True)
             reject_symlink_components(path, self.root)
-        except (ValueError, OSError):
-            return None
+        except (ValueError, OSError) as exc:
+            return self._record_failure(path, exc)
         try:
             path.write_text(
                 json.dumps(
@@ -2761,9 +2844,29 @@ class EvidenceStore:
                 ),
                 encoding="utf-8",
             )
-        except OSError:
-            return None
+        except OSError as exc:
+            return self._record_failure(path, exc)
         return str(path)
+
+    def _record_failure(self, path: Path, exc: BaseException):
+        """Remember (and warn about) a failed evidence write.
+
+        PATCH (v5): the previous implementation returned None with no
+        trace, so a read-only or full evidence directory produced a
+        run whose artifacts were missing while every tool call still
+        reported success.
+        """
+        entry = {
+            "path": str(path),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        if entry not in self.failures:
+            self.failures.append(entry)
+        warnings.warn(
+            f"Evidence artifact not written: {path} ({exc})",
+            stacklevel=3,
+        )
+        return None
 
     def write_json(
         self,
@@ -3402,7 +3505,7 @@ def _tree_sha256(snapshot: Dict[str, str]) -> str:
     commit says (a dirty working tree still gets a stable id)."""
     digest = hashlib.sha256()
     for path in sorted(snapshot):
-        if path == "__truncated__":
+        if path in ("__truncated__", "__skipped__"):
             continue
         digest.update(path.encode("utf-8"))
         digest.update(b"\0")
@@ -3439,9 +3542,16 @@ class ReproducibilityLock:
             _tree_sha256(snap) if snap else None
         )
         result["audited_tree_files"] = sum(
-            1 for k in snap if k != "__truncated__"
+            1
+            for k in snap
+            if k not in ("__truncated__", "__skipped__")
         )
         result["audited_tree_truncated"] = "__truncated__" in snap
+        # PATCH (v5): a snapshot that had to skip entries is not a
+        # complete picture of the audited tree.
+        result["audited_tree_incomplete"] = (
+            "__skipped__" in snap
+        )
 
         if not forge_executable:
             result["forge_version"] = (
@@ -4030,24 +4140,36 @@ class MutationTester:
         (assertEq(foo(a, b), c) -> assertEq(foo(a, foo(a), c);)
         produced unbalanced source that always failed to compile)
         and on assertions carrying a trailing message argument.
+
+        PATCH (v5): the call is located in a comment/string-free
+        copy of the source (the mask is length-preserving, so every
+        offset stays valid for the original text), and `'` is no
+        longer treated as a string delimiter — Solidity has no
+        single-quoted strings. Scanning the raw text matched the
+        first textual `assertEq(` even when it sat inside a comment
+        or a data string, so the mutation rewrote the wrong span:
+        a comment mention made a meaningless mutation look
+        applicable (false SURVIVED) and a string mention made a
+        correct test fail (false STRONG kill).
         """
-        m = re.search(rf"\b{re.escape(name)}\s*\(", source)
+        masked = _mask_comments_and_strings(source)
+        m = re.search(rf"\b{re.escape(name)}\s*\(", masked)
         if not m:
             return None
-        open_idx = source.find("(", m.start())
+        open_idx = masked.find("(", m.start())
         depth = 0
         in_str = None
         i = open_idx
         close_idx = -1
-        while i < len(source):
-            ch = source[i]
+        while i < len(masked):
+            ch = masked[i]
             if in_str:
                 if ch == "\\":
                     i += 2
                     continue
                 if ch == in_str:
                     in_str = None
-            elif ch in ('"', "'"):
+            elif ch == '"':
                 in_str = ch
             elif ch in "([{":
                 depth += 1
@@ -4062,7 +4184,7 @@ class MutationTester:
         if close_idx == -1:
             return None
 
-        body = source[open_idx + 1:close_idx]
+        body = masked[open_idx + 1:close_idx]
         base = open_idx + 1
         args: List[str] = []
         spans: List[tuple] = []
@@ -4078,18 +4200,20 @@ class MutationTester:
                     continue
                 if ch == in_str:
                     in_str = None
-            elif ch in ('"', "'"):
+            elif ch == '"':
                 in_str = ch
             elif ch in "([{":
                 depth += 1
             elif ch in ")]}":
                 depth -= 1
             elif ch == "," and depth == 0:
-                args.append(body[cur_start:i])
+                # Argument text is taken from the ORIGINAL source so
+                # string literals inside an argument survive.
+                args.append(source[base + cur_start:base + i])
                 spans.append((base + cur_start, base + i))
                 cur_start = i + 1
             i += 1
-        args.append(body[cur_start:])
+        args.append(source[base + cur_start:base + len(body)])
         spans.append((base + cur_start, base + len(body)))
         return args, spans
 
@@ -4325,17 +4449,39 @@ def _parse_unified_diff(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Parse a multi-file unified diff into
     {relative_path: [hunk, ...]} where a hunk holds the old/new
-    line lists. Only `+`/`-`/context lines are honoured; headers,
-    `\\ No newline` markers and git index lines are ignored."""
+    line lists.
+
+    PATCH (v5): the declared line counts decide when a hunk is
+    finished, so a hunk body line that happens to start with
+    `+++ ` (an added `++ flag`) or `--- ` (a removed `-- flag`) is
+    read as content instead of being mistaken for a file header and
+    silently dropped. The `\ No newline at end of file` marker is
+    recorded per side instead of being discarded, so a patch that
+    changes the trailing-newline state applies to the right text.
+    """
     if not isinstance(diff_text, str) or not diff_text.strip():
         raise PatchApplyError("Empty patch.")
 
     files: Dict[str, List[Dict[str, Any]]] = {}
     current: Optional[str] = None
     hunk: Optional[Dict[str, Any]] = None
+    old_seen = 0
+    new_seen = 0
+    last_kind: Optional[str] = None
+
+    def hunk_open() -> bool:
+        """True while the current hunk still expects body lines."""
+        if hunk is None:
+            return False
+        return (
+            old_seen < hunk.get("old_count", 0)
+            or new_seen < hunk.get("new_count", 0)
+        )
 
     for raw in diff_text.splitlines():
-        if raw.startswith("+++ "):
+        inside = hunk_open()
+
+        if raw.startswith("+++ ") and not inside:
             path = raw[4:].strip()
             if path.startswith("b/"):
                 path = path[2:]
@@ -4350,8 +4496,11 @@ def _parse_unified_diff(
                 )
             files[current] = []
             hunk = None
+            last_kind = None
             continue
-        if raw.startswith("--- ") or raw.startswith("diff "):
+        if raw.startswith("--- ") and not inside:
+            continue
+        if raw.startswith("diff ") and not inside:
             continue
         if raw.startswith("@@"):
             if current is None:
@@ -4359,7 +4508,8 @@ def _parse_unified_diff(
                     "Hunk before any +++ file header."
                 )
             m = re.match(
-                r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s*@@",
+                r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)"
+                r"(?:,(\d+))?\s*@@",
                 raw,
             )
             if not m:
@@ -4370,23 +4520,43 @@ def _parse_unified_diff(
                 "old": [],
                 "new": [],
                 "header": raw,
-                # PATCH (v5): keep the declared 1-based start line.
-                # It is the anchor the hunk is applied against.
+                # PATCH (v5): the declared 1-based start line is the
+                # anchor the hunk is applied against, and the
+                # declared counts bound the hunk body.
                 "old_start": int(m.group(1)),
+                "old_count": int(m.group(2) or 1),
+                "new_count": int(m.group(4) or 1),
             }
+            old_seen = 0
+            new_seen = 0
+            last_kind = None
             files[current].append(hunk)
             continue
         if raw.startswith("\\ No newline"):
+            # PATCH (v5): the marker belongs to the line just above
+            # it, so record which side has no trailing newline.
+            if hunk is not None:
+                if last_kind in ("old", "both"):
+                    hunk["old_no_newline"] = True
+                if last_kind in ("new", "both"):
+                    hunk["new_no_newline"] = True
             continue
         if hunk is None:
             continue
         if raw.startswith("+"):
             hunk["new"].append(raw[1:])
+            new_seen += 1
+            last_kind = "new"
         elif raw.startswith("-"):
             hunk["old"].append(raw[1:])
+            old_seen += 1
+            last_kind = "old"
         elif raw.startswith(" ") or raw == "":
             hunk["old"].append(raw[1:] if raw else "")
             hunk["new"].append(raw[1:] if raw else "")
+            old_seen += 1
+            new_seen += 1
+            last_kind = "both"
         else:
             raise PatchApplyError(
                 f"Unexpected diff line: {raw[:60]!r}"
@@ -4432,22 +4602,31 @@ def _apply_hunks(
             raise PatchApplyError(
                 f"Hunk without context/removal lines in {label}."
             )
-        anchor = hunk.get("old_start")
-        if isinstance(anchor, int) and anchor > 0:
-            anchor -= 1  # unified-diff line numbers are 1-based
+        declared = hunk.get("old_start")
+        if isinstance(declared, int) and declared > 0:
+            anchor = declared - 1  # unified-diff lines are 1-based
+            if anchor < cursor:
+                # PATCH (v5): a hunk that points BEFORE the end of the
+                # previous hunk is malformed (unified-diff hunks are
+                # ordered). Clamping it to the cursor used to let the
+                # search land on a LATER duplicate of the same block
+                # and silently patch the wrong line, so this is an
+                # explicit error: the diff must be re-generated with
+                # hunk headers in increasing file order.
+                raise PatchApplyError(
+                    f"Hunk is out of order in {label}: it declares "
+                    f"line {declared}, but the previous hunk already "
+                    f"consumed through line {cursor}. Hunks must be "
+                    f"ordered by file position. "
+                    f"{hunk['header'][:60]!r}"
+                )
         else:
-            anchor = cursor
-        if anchor < cursor:
             anchor = cursor
 
         window: List[int] = [anchor]
         for delta in range(1, PATCH_DIFF_FUZZ_LINES + 1):
             window.append(anchor + delta)
             window.append(anchor - delta)
-        # Drift fallback: scan forward from the end of the previous
-        # hunk so a wildly wrong declared offset still applies.
-        for delta in range(0, PATCH_DIFF_FUZZ_LINES + 1):
-            window.append(cursor + delta)
 
         found = None
         for pos in window:
@@ -4457,21 +4636,6 @@ def _apply_hunks(
                 found = pos
                 break
         if found is None:
-            earlier = next(
-                (
-                    pos
-                    for pos in range(0, cursor)
-                    if lines[pos:pos + len(old)] == old
-                ),
-                None,
-            )
-            if earlier is not None:
-                raise PatchApplyError(
-                    f"Hunk is out of order in {label}: its content "
-                    f"matches line {earlier + 1}, before the previous "
-                    f"hunk ended at line {cursor + 1}. "
-                    f"{hunk['header'][:60]!r}"
-                )
             raise PatchApplyError(
                 f"Hunk context does not match source in {label}: "
                 f"{hunk['header'][:60]!r}"
@@ -4508,6 +4672,21 @@ def apply_unified_diff(
     path = only_path if only_path is not None else next(iter(files))
     hunks = files[path]
     patched = _apply_hunks(source, hunks, path)
+
+    # PATCH (v5): honour `\ No newline at end of file`. Discarding the
+    # marker applied the patch with the wrong trailing newline, and a
+    # diff whose only effect was the trailing newline collapsed into
+    # the spurious "zero changes (no-op)" error below.
+    last = hunks[-1]
+    if last.get("new_no_newline") and patched.endswith("\n"):
+        patched = patched[:-1]
+    elif (
+        last.get("old_no_newline")
+        and not source.endswith("\n")
+        and not patched.endswith("\n")
+    ):
+        patched += "\n"
+
     if patched == source:
         raise PatchApplyError(
             "Patch applied to zero changes (no-op)."
@@ -4794,23 +4973,37 @@ class PatchDifferentialTester:
 class ExploitPoCValidator:
     """Validasi test mode EXPLOIT_MUST_SUCCEED."""
 
+    # PATCH (v5): identifier fragments must sit on a real word
+    # boundary (start of the name, after an underscore, or a
+    # camelCase capital) and the profit check must be a POSITIVE
+    # comparison. The old patterns matched any identifier merely
+    # CONTAINING a fragment — `spread` counted as a `pre` snapshot,
+    # `spending` counted as an `end` snapshot, and
+    # `assertTrue(noProfitPossible)` counted as a profit assertion —
+    # so a PoC that quantified no extraction passed the validator
+    # that exists to enforce exactly that.
     PROFIT_ASSERT_RE = re.compile(
-        r'assert(?:Gt|Ge|True|NotEq)\s*\(\s*'
-        r'(?:\w*(?:profit|gain|stolen|drained|delta|'
-        r'extracted|attackerAfter|attackerBalAfter)\w*)',
+        r'assert(?:Gt|Ge)\s*\(\s*[^;]{0,200}?'
+        r'(?:\w*(?:profit|gain|stolen|drained|delta|extracted)\w*'
+        r'|\w*(?:attackerAfter|attackerBalAfter|balAfter|afterBal|'
+        r'postBal|balanceAfter|endBalance)\w*)',
         re.IGNORECASE,
     )
     BEFORE_RE = re.compile(
-        r'(?:uint\d*|int\d*)\s+\w*'
-        r'(?:before|initial|pre|start|balBefore|balPre)\w*'
-        r'\s*=\s*[^;]*'
+        r'(?:uint\d*|int\d*)\s+'
+        + _snapshot_name_pattern(
+            ("before", "pre", "initial", "start")
+        )
+        + r'\s*=\s*[^;]*'
         r'(?:balanceOf|totalAssets|totalSupply|getReserves)',
         re.IGNORECASE,
     )
     AFTER_RE = re.compile(
-        r'(?:uint\d*|int\d*)\s+\w*'
-        r'(?:after|final|post|end|balAfter|balPost)\w*'
-        r'\s*=\s*[^;]*'
+        r'(?:uint\d*|int\d*)\s+'
+        + _snapshot_name_pattern(
+            ("after", "post", "end", "final")
+        )
+        + r'\s*=\s*[^;]*'
         r'(?:balanceOf|totalAssets|totalSupply|getReserves)',
         re.IGNORECASE,
     )
@@ -5188,6 +5381,29 @@ class SecurityAnalysisServices:
                 ),
             })
 
+        # PATCH (v5): property_text used to be optional, so omitting it
+        # silently skipped the known-issue filter (is_known_issue("") is
+        # None) and downgraded the duplicate fingerprint to the
+        # file/test-name branch. When the bounty spec declares known
+        # issues, the property is mandatory.
+        if (
+            self.scope_enforcer.known_issues
+            and not str(property_text or "").strip()
+        ):
+            return self._json({
+                "success": False,
+                "result_type": "PROPERTY_TEXT_REQUIRED",
+                "error": (
+                    "property_text is required: the bounty spec "
+                    "declares known issues, so the property has to be "
+                    "stated for the known-issue filter (and the "
+                    "duplicate fingerprint) to work."
+                ),
+                "known_issues_count": len(
+                    self.scope_enforcer.known_issues
+                ),
+            })
+
         known = self.scope_enforcer.is_known_issue(property_text)
         if known:
             return self._json({
@@ -5470,9 +5686,10 @@ class SecurityAnalysisServices:
         )
         after = WorkspaceIntegrity.snapshot(self.project)
         tampered = before != after
-        snapshot_unverified = (
-            "__truncated__" in before
-            or "__truncated__" in after
+        snapshot_unverified = any(
+            marker in snapshot
+            for snapshot in (before, after)
+            for marker in ("__truncated__", "__skipped__")
         )
 
         result["hypothesis_id"] = hypothesis_id
