@@ -217,6 +217,8 @@ File pipeline yang perlu ada di root repo:
 .
 ├── README.md                  ← file ini
 ├── pipeline_final.py          ← pipeline utama
+├── tests/                     ← regression test lapisan deterministik
+│   └── test_pipeline_deterministic.py
 └── .gitignore
 ```
 
@@ -243,6 +245,7 @@ Seluruh pipeline berada di satu file, `pipeline_final.py` (±8.700 baris). Tidak
 - Blok terbesar: `SoliditySecurityCrew` (definisi agen + task), `SecurityAnalysisServices` (orkestrasi semua layanan deterministik), `AgentLogManager` (log + progress bar), `BountyEligibilityGate`.
 - Seksi ditandai banner komentar berurutan: `CONFIG` → `ENVIRONMENT` → `PATH / TEXT HELPERS` → `AUTHZ BOUNDARY DETECTOR` → `ROLE-GRANT-TO-ATTACKER DETECTOR` → `MODERN SURFACE SCANNER` → `BUDGET` → `FOUNDRY CONFIG AUDIT` → `FORGE-STD LOCATOR` → `BOUNTY ELIGIBILITY GATE` → `JUDGE VERDICT PARSER` → `BOUNTY SCOPE ENFORCER` → `TEST SPECIFICATION` → `FINDING CONFIDENCE` → `INTEGRITY` → `EVIDENCE STORE` → `ANTI-PSEUDO TEST VALIDATOR` → `SCOPE / DUPLICATE` → `SOURCE SLICER` → `REPRODUCIBILITY LOCK` → `TEST FILE WRITER` → `FORGE RUNNER` → `MUTATION TESTER` → `PATCH-DIFFERENTIAL VALIDATOR` → `EXPLOIT POC VALIDATOR` → `SERVICES` → `TOOL SCHEMAS` → `AGENT LIMITS` → `PSEUDO DETECTION` → `STATIC ANALYSIS PREPASS` → `AGENT LOG MANAGER` → `CREW` → `MAIN`.
 - Entry point: `if __name__ == "__main__"` memakai `argparse`, membangun `PipelineConfig`, lalu `SoliditySecurityCrew(config).preflight()` → `.run()`.
+- Regression test lapisan deterministik: `tests/test_pipeline_deterministic.py` (73 check; tanpa forge, LLM, atau network).
 
 Catatan: komentar patch di dalam file memakai penanda `(v2)` / `(v3)` / `(v4)`. Penanda itu menunjukkan **kapan** sebuah kontrol ditambahkan, bukan nomor rilis — konvensi ini didokumentasikan di docstring kepala file.
 
@@ -631,11 +634,12 @@ Belum diimplementasikan, sengaja ditunda sampai fondasi stabil:
 
 Ini proyek eksperimental. Sebelum membuka PR besar:
 
-1. Jalankan `python3 -c "import ast, pathlib; ast.parse(pathlib.Path('pipeline_final.py').read_text())"`.
-2. Pastikan tidak ada `subprocess.run` tanpa `shell=False` dan tanpa `start_new_session=True`.
-3. Pastikan tidak ada `Path.write_text` tanpa `reject_symlink_components` di jalur sebelumnya.
-4. Pastikan validasi konten baru dijalankan **sebelum** budget dikonsumsi.
-5. Tambahkan test untuk setiap perubahan di lapisan deterministik.
+1. Jalankan `python3 tests/test_pipeline_deterministic.py` (butuh `crewai` + `pydantic`; tanpa keduanya file itu SKIP dengan exit code 2). Suite ini mengunci perilaku lapisan deterministik: parser unified diff, gate kelayakan bounty, validasi pseudo-test/PoC, guard symlink, budget, dan integritas snapshot.
+2. Jalankan `python3 -c "import ast, pathlib; ast.parse(pathlib.Path('pipeline_final.py').read_text())"`.
+3. Pastikan tidak ada `subprocess.run` tanpa `shell=False` dan tanpa `start_new_session=True`.
+4. Pastikan tidak ada `Path.write_text` tanpa `reject_symlink_components` di jalur sebelumnya.
+5. Pastikan validasi konten baru dijalankan **sebelum** budget dikonsumsi.
+6. Tambahkan test ke `tests/test_pipeline_deterministic.py` untuk setiap perubahan di lapisan deterministik.
 
 Area yang paling berharga untuk dikontribusi:
 
