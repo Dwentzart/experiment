@@ -1,0 +1,5 @@
+invoke_order:
+- payloads
+linked_skills:
+- skills/recon/recon-01-osint/
+wordlist_id: recon-16-tech-fingerprint

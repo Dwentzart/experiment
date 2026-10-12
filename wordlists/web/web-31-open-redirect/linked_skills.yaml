@@ -1,0 +1,5 @@
+invoke_order:
+- payloads
+linked_skills:
+- skills/web/web-28-open-redirect/
+wordlist_id: web-31-open-redirect

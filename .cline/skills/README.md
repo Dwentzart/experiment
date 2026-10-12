@@ -1,35 +1,62 @@
-# Web3 Bug Bounty Skills
+# Security / Bug Bounty Skills (Cline)
 
-Kumpulan 11 skill Cline/Claude untuk smart contract security, dipasang di
-`.cline/skills/` supaya otomatis terbaca saat workspace ini dibuka di Cline
-Desktop (dan kompatibel juga dengan Claude Code / AI lain yang membaca file skill).
+Kumpulan **171 skill** (format Agent Skills) untuk smart contract security, bug bounty
+web2/API, dan red-team. Dipasang di `.cline/skills/<name>/SKILL.md` supaya otomatis
+terbaca saat workspace ini dibuka di **Cline Desktop**.
 
-## Sumber
+## Cara Cline menemukan skill (penting)
 
-- Upstream: https://github.com/awarexone/web3-bug-bounty-hunting-ai-skills
-- Dibuat dari 2,749 laporan Immunefi, 681 reproduksi DeFiHackLabs, dan pengalaman hunt nyata.
-- Lisensi: MIT (lihat `LICENSE.web3-bug-bounty-hunting-ai-skills`).
+Dari source `@cline/core`: skill harus **tepat satu level** di bawah `.cline/skills/`,
+yaitu `.cline/skills/<folder>/SKILL.md`, dan **nama folder wajib sama persis** dengan
+field `name` di frontmatter `SKILL.md`. Folder bersarang (mis. `pack/skills/foo/SKILL.md`)
+**tidak** akan terdeteksi - karena itu semua skill di sini sudah di-flatten.
 
-## Daftar skill
+Validasi cepat semua skill:
 
-| Skill | Isi |
-|-------|-----|
-| `web3-start-here` | Indeks utama + cara navigasi rantai skill |
-| `web3-hunt-foundation` | Mindset hunter, target scoring (scorecard 10 poin), recon |
-| `web3-bug-classes` | 10 kelas bug DeFi + pola + contoh Solidity |
-| `web3-grep-arsenal` | Arsenal grep/regex per kelas bug |
-| `web3-poc-foundry` | Panduan PoC Foundry + cheatcodes + template exploit |
-| `web3-triage-report` | Gerbang validasi, format laporan Immunefi, 20 contoh dibayar |
-| `web3-methodology-research` | Sintesis metodologi ToB, SlowMist, ConsenSys, Cyfrin |
-| `web3-case-study-role-misconfig` | Studi kasus hunt: role misconfiguration |
-| `web3-ai-tools` | Tools AI (Shannon, SmartGuard, CAI, LuaN1ao) |
-| `web3-hunt-zksync-era` | Studi kasus pertahanan: ZKsync Era (0 temuan) |
-| `web3-solidity-audit-mcp` | MCP server: Slither + Aderyn + SWC di Claude Code |
+```bash
+cd .cline/skills
+for d in */; do d=${d%/}; n=$(grep -am1 '^name:' "$d/SKILL.md" | sed 's/name:[[:space:]]*//');
+  [ "$n" = "$d" ] || echo "MISMATCH $d / $n"; done; echo done
+```
 
-## Cara pakai
+## Paket yang dipasang
 
-Buka workspace ini di Cline Desktop — skill akan terdeteksi otomatis.
-Untuk mulai, minta agen membaca `.cline/skills/web3-start-here/SKILL.md`.
+### 1. Web3 / Smart Contract (11 skill) - `web3-*`
+Sumber: [awarexone/web3-bug-bounty-hunting-ai-skills](https://github.com/awarexone/web3-bug-bounty-hunting-ai-skills) (MIT).
+Dibangun dari 2,749 laporan Immunefi + 681 reproduksi DeFiHackLabs.
+Mulai dari `web3-start-here`, lalu `web3-bug-classes`, `web3-grep-arsenal`,
+`web3-poc-foundry`, `web3-triage-report`, dst.
 
-> Catatan etika: skill ini untuk mengaudit kontrak yang kamu miliki atau punya
-> izin eksplisit. Bukan untuk memindai kontrak pihak ketiga tanpa izin.
+### 2. HuntPack - web2 bug bounty pipeline (12 skill: 11 + router)
+Sumber: [Aetherdz/huntpack](https://github.com/Aetherdz/huntpack) (MIT).
+Pipeline 6 tahap: Understand -> Recon -> Hunt -> Discipline -> Prove -> Deliver.
+Entry point: skill `router`. Lalu `web2-recon`, `web2-vuln-classes`,
+`business-logic-hunter`, `api-security`, `false-positive-killer`,
+`triage-validation`, `attack-path-builder`, `report-writing`, dst.
+
+### 3. claude-hunterKit - bug bounty / red-team (148 skill)
+Sumber: [vigilantshield/Claude-HunterKit](https://github.com/vigilantshield/Claude-HunterKit) (Apache-2.0).
+148 skill terstruktur per domain: `web-*` (51 kelas web), `api-*`, `ai-*` (24 AI/LLM),
+`auth-*`, `network-*`, `cloud-*`, `recon-*`, `report-*`.
+Referensi payload/wordlist (1,754 file) ada di folder `wordlists/` di root repo -
+path skill `wordlists/<domain>/<nama>/` resolve dari root workspace.
+
+## Daftar cepat
+
+| Paket | Jumlah | Prefix | Contoh skill |
+|-------|--------|--------|--------------|
+| Web3 | 11 | `web3-` | `web3-start-here`, `web3-poc-foundry` |
+| HuntPack | 12 | (beragam) | `router`, `web2-vuln-classes`, `api-security` |
+| claude-hunterKit | 148 | `web-`, `api-`, `ai-`, ... | `web-23-idor`, `api-04-bola` |
+
+Total: **171 skill**.
+
+## Lisensi
+
+- `LICENSE.web3-bug-bounty-hunting-ai-skills` - MIT (shuvonsec)
+- `LICENSE.huntpack` - MIT (Aetherdz)
+- claude-hunterKit - Apache-2.0 (vigilantshield), lihat repo upstream.
+
+> Etika: semua skill ini untuk pengujian **yang diotorisasi** saja - target milikmu
+> sendiri atau yang kamu punya izin eksplisit. Bukan untuk menyerang sistem pihak
+> ketiga tanpa izin.

@@ -1,0 +1,5 @@
+invoke_order:
+- payloads
+linked_skills:
+- skills/web/web-40-subdomain-takeover/
+wordlist_id: web-21-subdomain-takeover

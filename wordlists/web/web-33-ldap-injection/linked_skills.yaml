@@ -1,0 +1,5 @@
+invoke_order:
+- payloads
+linked_skills:
+- skills/web/web-07-ldap-injection/
+wordlist_id: web-33-ldap-injection
