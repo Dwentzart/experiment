@@ -1,0 +1,5 @@
+invoke_order:
+- payloads
+linked_skills:
+- skills/web/web-11-saml/
+wordlist_id: web-68-oauth-saml-advanced

@@ -1,0 +1,5 @@
+invoke_order:
+- payloads
+linked_skills:
+- skills/web/web-25-file-upload/
+wordlist_id: web-08-file-upload-lfi

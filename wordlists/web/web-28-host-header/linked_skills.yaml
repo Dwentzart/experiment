@@ -1,0 +1,5 @@
+invoke_order:
+- payloads
+linked_skills:
+- skills/web/web-30-host-header/
+wordlist_id: web-28-host-header

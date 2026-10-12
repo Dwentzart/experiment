@@ -1,0 +1,5 @@
+invoke_order:
+- payloads
+linked_skills:
+- skills/recon/recon-02-osint-methodology/
+wordlist_id: recon-17-js-analysis

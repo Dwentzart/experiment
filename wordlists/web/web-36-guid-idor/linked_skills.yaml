@@ -1,0 +1,5 @@
+invoke_order:
+- payloads
+linked_skills:
+- skills/web/web-23-idor/
+wordlist_id: web-36-guid-idor
